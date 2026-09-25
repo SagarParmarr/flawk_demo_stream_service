@@ -1,0 +1,27 @@
+[Unit]
+Description=Flawk Demo Stream Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flawk-demo
+Group=flawk-demo
+WorkingDirectory=/opt/flawk/flawk_demo_stream_service
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/flawk-demo/demo.env
+ExecStart=/usr/bin/node --experimental-sqlite dist/src/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+StateDirectory=flawk-demo
+CacheDirectory=flawk-demo
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/flawk-demo /var/cache/flawk-demo
+
+[Install]
+WantedBy=multi-user.target

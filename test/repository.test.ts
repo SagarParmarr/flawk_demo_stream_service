@@ -1,0 +1,35 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import type { DemoSession } from '../src/domain/demo.js';
+import { SqliteDemoRepository } from '../src/infrastructure/sqlite-repository.js';
+
+const demo = (id: string, ownerId: number, status: DemoSession['status']): DemoSession => ({
+  id, ownerId, unitId: 1, adaptiveSessionId: 'capture', goLiveSessionId: null, playbackUrl: null,
+  idempotencyKey: id, status, operation: null, assetType: 'default', assetId: null, decisionId: null,
+  decisionCursor: 0, priority: 0, takeoverCount: 0, selectedStartedAt: null, selectedDurationSeconds: null,
+  nodeStopped: false, laravelStopped: false, startedAt: new Date().toISOString(),
+  expiresAt: new Date(Date.now() + 60000).toISOString(), error: null,
+});
+
+test('SQLite permits one active Demo per owner and persists the decision cursor', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'flawk-demo-test-'));
+  const filename = path.join(directory, 'demo.sqlite');
+  try {
+    const first = new SqliteDemoRepository(filename);
+    first.create(demo('demo-one', 4, 'starting'));
+    assert.throws(() => first.create(demo('demo-two', 4, 'starting')));
+    const row = first.find('demo-one')!;
+    row.decisionCursor = 7;
+    row.status = 'stopped';
+    first.save(row);
+    first.close();
+    const reopened = new SqliteDemoRepository(filename);
+    assert.equal(reopened.find('demo-one')?.decisionCursor, 7);
+    reopened.create(demo('demo-two', 4, 'starting'));
+    assert.equal(reopened.listNonterminal().length, 1);
+    reopened.close();
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
