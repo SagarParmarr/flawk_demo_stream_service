@@ -1,14 +1,15 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { Publisher, PublisherCredentials } from '../../domain/demo.js';
 
-function ingestUrl(ingest: PublisherCredentials, priority: number): string {
+export function ingestUrl(ingest: PublisherCredentials, priority: number): string {
   const endpoint = new URL(ingest.ingest_server.startsWith('rtmps://')
     ? ingest.ingest_server : `rtmps://${ingest.ingest_server}`);
   if (endpoint.protocol !== 'rtmps:') throw new Error('IVS ingest must use RTMPS');
   endpoint.port ||= '443';
   endpoint.pathname = endpoint.pathname.replace(/\/+$/, '') || '/app';
   endpoint.search = '';
-  return `${endpoint.toString().replace(/\/$/, '')}/${encodeURIComponent(ingest.stream_key)}?priority=${priority}`;
+  const streamUrl = `${endpoint.toString().replace(/\/$/, '')}/${encodeURIComponent(ingest.stream_key)}`;
+  return priority > 0 ? `${streamUrl}?priority=${priority}` : streamUrl;
 }
 
 export function ffmpegArgs(input: string, output: string, hasAudio: boolean): string[] {
