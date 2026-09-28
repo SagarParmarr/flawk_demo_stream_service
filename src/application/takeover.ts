@@ -25,15 +25,27 @@ export function takeoverResult(status: PublisherStatus, baseline: PublisherStatu
   return 'pending';
 }
 
+export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error('Publisher operation cancelled'));
+  return new Promise((resolve, reject) => {
+    const cancel = () => reject(new Error('Publisher operation cancelled'));
+    signal.addEventListener('abort', cancel, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', cancel));
+  });
+}
+
 export async function waitForTakeover(replacement: Publisher,
-  status: () => Promise<PublisherStatus>, baseline: PublisherStatus, timeoutMs = 12000): Promise<void> {
+  status: () => Promise<PublisherStatus>, baseline: PublisherStatus, timeoutMs = 12000, signal?: AbortSignal): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!replacement.alive()) throw new Error('Replacement publisher exited before takeover');
-    const outcome = takeoverResult(await status(), baseline);
+    if (signal?.aborted) throw new Error('Publisher operation cancelled');
+    const current = signal ? await abortable(status(), signal) : await status();
+    const outcome = takeoverResult(current, baseline);
     if (outcome === 'confirmed') return;
     if (outcome === 'failed') throw new Error('IVS rejected publisher takeover');
-    await new Promise((resolve) => setTimeout(resolve, 750));
+    const delay = new Promise<void>((resolve) => setTimeout(resolve, 750));
+    await (signal ? abortable(delay, signal) : delay);
   }
   throw new Error('IVS did not confirm publisher takeover');
 }

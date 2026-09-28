@@ -40,3 +40,14 @@ Use `/health/live` for process liveness and `/health/ready` for startup readines
 Production rollout should verify one physical phone and screen: default first, selection takeover, stable HLS URL, later decision, no-decision behavior, Stop, duplicate taps, and service restart. Local tests do not prove AWS publisher connectivity or physical playback.
 
 The once-only clip boundary is best effort: IVS takeover confirmation has variable latency. The selected FFmpeg input remains looped until default takeover is confirmed so a slow or failed return cannot interrupt the live stream. Frame-exact once-only playback would require a playout pipeline that can concatenate sources without waiting for a second IVS takeover.
+
+
+## Demo lifecycle and selected playback
+
+`SELECTED_ASSET_HOLD_SECONDS` defaults to 30 and accepts integer values from 20 through 30. The selected publisher loops until the deadline measured from confirmed IVS takeover. Fresh valid decisions switch directly to another selected asset; a fresh same-asset decision renews the window without republishing. Duplicate decisions and no-decision outcomes do not renew it. At expiry the coordinator restores its cached default source. Failed default restoration ends the Demo.
+
+Mobile clients send `mobile_presence_required: true` on `POST /demo-streams`. Existing clients omit it and retain their previous lifetime policy. Opted-in clients call owner-authenticated `POST /demo-streams/:id/heartbeat` every 10 seconds; absence for 60 seconds stops both downstream sessions. The lease is enforced during startup, recovery, and live playback independently of upstream polling. Expired/stopping/terminal Demos cannot be renewed.
+
+Status responses additionally include nullable `selected_expires_at` and `presence_expires_at`. These are persisted in SQLite JSON payloads; older records normalize missing fields to null without a table migration. Stop returns 202 and may report `stopping`; clients retain their pending-stop reference until terminal confirmation.
+
+Deploy the backend before distributing the updated mobile client. Local tests do not verify physical auto-lock behavior, background/gesture navigation, real IVS takeover, or HLS playback latency. Validate these on physical iPhone/Android and a target screen with the same session and playback URL through default → selected A → selected B → default. Record shutdown reason, expiry, and failed-switch logs without credentials.

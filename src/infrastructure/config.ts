@@ -16,6 +16,7 @@ export interface Config {
   pollIntervalMs: number;
   heartbeatIntervalMs: number;
   maxDemoDurationMs: number;
+  selectedAssetHoldSeconds: number;
 }
 
 const required = (name: string): string => {
@@ -57,5 +58,6 @@ export function loadConfig(): Config {
     pollIntervalMs: integer('POLL_INTERVAL_MS', 2000, 500, 30000),
     heartbeatIntervalMs: integer('HEARTBEAT_INTERVAL_MS', 30000, 5000, 60000),
     maxDemoDurationMs: integer('MAX_DEMO_DURATION_MS', 1800000, 60000, 1800000),
+    selectedAssetHoldSeconds: integer('SELECTED_ASSET_HOLD_SECONDS', 30, 20, 30),
   };
 }

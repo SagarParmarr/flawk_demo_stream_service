@@ -35,6 +35,9 @@ async function until(check: () => boolean): Promise<void> {
 
 function fixture(decisions: Array<{ decision_id: string; cycle_number: number; result: 'SELECT_ASSET' | 'NO_DECISION'; expires_at: string | null; asset: { id: number; name: string; s3_uri: string } | null }> = [],
   failure?: 'node-create' | 'slow-create' | 'download' | 'takeover') {
+  let offset = 0;
+  const clock = () => Date.now() + offset;
+  const advance = (ms: number) => { offset += ms; };
   const repo = new MemoryRepository();
   const calls = { created: 0, stoppedNode: 0, stoppedLaravel: 0, publisherStarts: 0, content: [] as string[] };
   let publisherStarts = 0;
@@ -61,7 +64,7 @@ function fixture(decisions: Array<{ decision_id: string; cycle_number: number; r
     stop: async () => { calls.stoppedNode++; },
   } as GoLivePort;
   const config = { defaultS3Uri: 's3://media/default.mp4', pollIntervalMs: 500,
-    heartbeatIntervalMs: 5000, maxDemoDurationMs: 60000 } as Config;
+    heartbeatIntervalMs: 5000, maxDemoDurationMs: 600000, selectedAssetHoldSeconds: 30 } as Config;
   const media = { prepare: async (uri: string) => {
     if (failure === 'download' && !uri.includes('default')) throw new Error('S3 unavailable');
     return { path: uri, hasAudio: true, durationSeconds: uri.includes('default') ? 10 : 0.1 };
@@ -72,7 +75,7 @@ function fixture(decisions: Array<{ decision_id: string; cycle_number: number; r
     return new FakePublisher(duration);
   } } as PublisherPort;
   const log = { warn: () => undefined, error: () => undefined } as unknown as FastifyBaseLogger;
-  return { service: new DemoService(config, repo, laravel, node, media, ffmpeg, log), repo, calls };
+  return { service: new DemoService(config, repo, laravel, node, media, ffmpeg, log, clock), repo, calls, advance, laravel, media, node };
 }
 
 test('Start is idempotent and Stop ends both downstream sessions', async () => {
@@ -94,10 +97,11 @@ test('selected decision is consumed once, shown live, then restored to default',
   const choice = { decision_id: 'choice-one', cycle_number: 1, result: 'SELECT_ASSET' as const,
     expires_at: new Date(Date.now() + 60000).toISOString(),
     asset: { id: 7, name: 'Selected', s3_uri: 's3://media/selected.mp4' } };
-  const { service, repo, calls } = fixture([choice]);
+  const { service, repo, calls, advance } = fixture([choice]);
   const started = await service.start('capture-two', 1, 'choice-key', 'Bearer token');
   await until(() => repo.find(started.id)?.decisionCursor === 1);
   await until(() => calls.content.includes('selected'));
+  advance(31_000);
   await until(() => repo.find(started.id)?.status === 'default_live' && calls.content.filter((type) => type === 'default').length >= 2);
   assert.equal(repo.find(started.id)?.playbackUrl, 'https://ivs.test/one.m3u8');
   assert.equal(repo.find(started.id)?.decisionCursor, 1);
@@ -105,9 +109,9 @@ test('selected decision is consumed once, shown live, then restored to default',
   await until(() => repo.find(started.id)?.status === 'stopped');
 });
 
-test('ordered decisions skip no-decision outcomes and play later choices once each', async () => {
+test('only the newest valid backlog choice is selected', async () => {
   const expires = new Date(Date.now() + 60000).toISOString();
-  const { service, repo, calls } = fixture([
+  const { service, repo, calls, advance } = fixture([
     { decision_id: 'no-choice', cycle_number: 1, result: 'NO_DECISION', expires_at: null, asset: null },
     { decision_id: 'first-choice', cycle_number: 2, result: 'SELECT_ASSET', expires_at: expires,
       asset: { id: 11, name: 'First', s3_uri: 's3://media/first.mp4' } },
@@ -115,10 +119,12 @@ test('ordered decisions skip no-decision outcomes and play later choices once ea
       asset: { id: 12, name: 'Second', s3_uri: 's3://media/second.mp4' } },
   ]);
   const started = await service.start('capture-ordered', 1, 'ordered-key', 'Bearer token');
-  await until(() => calls.content.filter((type) => type === 'selected').length === 2);
-  await until(() => calls.content.filter((type) => type === 'default').length === 3);
+  await until(() => repo.find(started.id)?.assetId === 12);
   assert.equal(repo.find(started.id)?.decisionCursor, 3);
-  assert.deepEqual(calls.content, ['default', 'selected', 'default', 'selected', 'default']);
+  assert.deepEqual(calls.content, ['default', 'selected']);
+  advance(31_000);
+  await until(() => calls.content.length === 3);
+  assert.deepEqual(calls.content, ['default', 'selected', 'default']);
   await service.stop(started.id, 'Bearer token');
   await until(() => repo.find(started.id)?.status === 'stopped');
 });
@@ -143,6 +149,7 @@ test('recovery restarts default without replaying an already processed decision'
     idempotencyKey: 'old-key', status: 'selected_live', operation: null, assetType: 'selected',
     assetId: 5, decisionId: 'old-choice', decisionCursor: 7, priority: 2, takeoverCount: 2,
     selectedStartedAt: now.toISOString(), selectedDurationSeconds: 10,
+    selectedExpiresAt: now.toISOString(), presenceExpiresAt: null,
     nodeStopped: false, laravelStopped: false, startedAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + 60000).toISOString(), error: null });
   await service.recover();
@@ -199,4 +206,139 @@ test('Stop during Node creation waits for the new downstream session and cleans 
   await until(() => repo.find(id)?.status === 'stopped');
   assert.equal(calls.stoppedNode, 1);
   assert.equal(calls.stoppedLaravel, 1);
+});
+
+const choice = (cycle: number, assetId: number) => ({ decision_id: `decision-${cycle}`, cycle_number: cycle,
+  result: 'SELECT_ASSET' as const, expires_at: null,
+  asset: { id: assetId, name: 'Selected', s3_uri: `s3://media/selected-${assetId}.mp4` } });
+
+test('direct selected replacement and same-asset renewal never insert default', async () => {
+  const feed = [choice(1, 7)];
+  const { service, repo, calls, advance } = fixture(feed);
+  const demo = await service.start('capture-replace', 1, 'replace-key', 'token');
+  await until(() => repo.find(demo.id)?.assetId === 7);
+  const firstDeadline = repo.find(demo.id)!.selectedExpiresAt!;
+  advance(5000);
+  feed.push(choice(2, 8));
+  await until(() => repo.find(demo.id)?.assetId === 8);
+  assert.deepEqual(calls.content, ['default', 'selected', 'selected']);
+  const starts = calls.publisherStarts;
+  advance(5000);
+  feed.push(choice(3, 8));
+  await until(() => repo.find(demo.id)?.decisionId === 'decision-3');
+  const renewed = repo.find(demo.id)!.selectedExpiresAt!;
+  assert.ok(Date.parse(renewed) > Date.parse(firstDeadline) + 9000);
+  assert.equal(calls.publisherStarts, starts);
+  feed.push({ ...choice(4, 8), decision_id: 'decision-3' });
+  await until(() => repo.find(demo.id)?.decisionCursor === 4);
+  assert.equal(repo.find(demo.id)?.selectedExpiresAt, renewed);
+  feed.push({ decision_id: 'none', cycle_number: 5, result: 'NO_DECISION', expires_at: null, asset: null } as any);
+  await until(() => repo.find(demo.id)?.decisionCursor === 5);
+  assert.equal(repo.find(demo.id)?.selectedExpiresAt, renewed);
+  advance(31_000);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  await service.stop(demo.id, 'token');
+});
+
+test('deadline restoration is independent of a hung decision request', async () => {
+  const { service, repo, laravel, advance } = fixture([choice(1, 7)]);
+  const demo = await service.start('capture-slow-feed', 1, 'slow-feed', 'token');
+  await until(() => repo.find(demo.id)?.status === 'selected_live');
+  let release!: (feed: Awaited<ReturnType<LaravelPort['decisions']>>) => void;
+  laravel.decisions = async () => new Promise((resolve) => { release = resolve; });
+  await until(() => Boolean(release));
+  advance(31_000);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  await service.stop(demo.id, 'token');
+  release({ owner_id: 4, unit_ids: [1], state: 'COMPLETE', decisions: [] });
+});
+
+test('slow media preparation cannot postpone expiry, and Stop discards prepared media', async () => {
+  const feed = [choice(1, 7)];
+  const { service, repo, media, calls, advance } = fixture(feed);
+  const demo = await service.start('capture-slow-media', 1, 'slow-media', 'token');
+  await until(() => repo.find(demo.id)?.assetId === 7);
+  let release!: (media: Awaited<ReturnType<MediaPort['prepare']>>) => void;
+  media.prepare = async () => new Promise((resolve) => { release = resolve; });
+  feed.push(choice(2, 8));
+  await until(() => Boolean(release));
+  advance(31_000);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  await service.stop(demo.id, 'token');
+  const starts = calls.publisherStarts;
+  release({ path: 'prepared', hasAudio: true, durationSeconds: 120 });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(calls.publisherStarts, starts);
+});
+
+test('presence lease expires even with a hung feed; heartbeat cannot resurrect it', async () => {
+  const { service, repo, laravel, advance } = fixture();
+  laravel.decisions = async () => new Promise(() => undefined);
+  const demo = await service.start('capture-lease', 1, 'lease-key', 'token', true);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  advance(30_000);
+  const renewed = await service.heartbeat(demo.id, 'token');
+  assert.ok(Date.parse(renewed.presenceExpiresAt!) > Date.parse(demo.presenceExpiresAt!));
+  advance(61_000);
+  const expired = await service.heartbeat(demo.id, 'token');
+  assert.equal(expired.status, 'stopping');
+  await until(() => repo.find(demo.id)?.status === 'stopped');
+  assert.equal((await service.heartbeat(demo.id, 'token')).status, 'stopped');
+});
+
+test('failed default restoration ends Demo instead of looping selected indefinitely', async () => {
+  const { service, repo, node, advance } = fixture([choice(1, 7)]);
+  const demo = await service.start('capture-failed-default', 1, 'failed-default', 'token');
+  await until(() => repo.find(demo.id)?.status === 'selected_live');
+  node.status = async () => { throw new Error('IVS unavailable'); };
+  advance(31_000);
+  await until(() => repo.find(demo.id)?.status === 'failed');
+});
+
+
+test('long assets are interrupted at the hold deadline; short assets do not restore early', async () => {
+  const { service, repo, media, calls, advance } = fixture([choice(1, 7)]);
+  media.prepare = async (uri) => ({ path: uri, hasAudio: true, durationSeconds: 120 });
+  const demo = await service.start('capture-long', 1, 'long-key', 'token');
+  await until(() => repo.find(demo.id)?.status === 'selected_live');
+  assert.equal(repo.find(demo.id)?.selectedDurationSeconds, 120);
+  advance(20_000);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(repo.find(demo.id)?.status, 'selected_live');
+  assert.deepEqual(calls.content, ['default', 'selected']);
+  advance(11_000);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  await service.stop(demo.id, 'token');
+});
+
+test('presence watchdog expires on its own, and non-owner cannot renew a lease', async () => {
+  const { service, repo, laravel, advance } = fixture();
+  const demo = await service.start('capture-owner', 1, 'owner-key', 'token', true);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  const deadline = repo.find(demo.id)?.presenceExpiresAt;
+  laravel.validate = async (id) => ({ session_id: id, owner_id: 99, unit_ids: [1], state: 'COMPLETE' });
+  await assert.rejects(service.heartbeat(demo.id, 'other-token'), (error: unknown) => error instanceof DemoError && error.code === 403);
+  assert.equal(repo.find(demo.id)?.presenceExpiresAt, deadline);
+  advance(61_000);
+  await until(() => repo.find(demo.id)?.status === 'stopped');
+});
+
+test('deadline interrupts an in-flight selected takeover before restoring default', async () => {
+  const feed = [choice(1, 7)];
+  const { service, repo, node, calls, advance } = fixture(feed);
+  const demo = await service.start('capture-race', 1, 'race-key', 'token');
+  await until(() => repo.find(demo.id)?.assetId === 7);
+  const status = node.status;
+  let block = true;
+  node.status = async (...args) => {
+    if (block) return new Promise(() => undefined);
+    return status(...args);
+  };
+  feed.push(choice(2, 8));
+  await until(() => repo.find(demo.id)?.operation === 'switching_selected');
+  block = false;
+  advance(31_000);
+  await until(() => repo.find(demo.id)?.status === 'default_live');
+  assert.deepEqual(calls.content, ['default', 'selected', 'default']);
+  await service.stop(demo.id, 'token');
 });

@@ -27,13 +27,13 @@ export function registerRoutes(app: FastifyInstance, service: DemoService, ready
     return { status: 'ok' };
   });
 
-  app.post<{ Body: { unit_ids: number[]; adaptive_session_id: string } }>('/demo-streams', {
+  app.post<{ Body: { unit_ids: number[]; adaptive_session_id: string; mobile_presence_required?: boolean } }>('/demo-streams', {
     schema: { body: { type: 'object', required: ['unit_ids', 'adaptive_session_id'], additionalProperties: false,
       properties: { unit_ids: { type: 'array', minItems: 1, maxItems: 1, items: { type: 'integer', minimum: 1 } },
-        adaptive_session_id: { type: 'string', pattern: uuid } } } },
+        adaptive_session_id: { type: 'string', pattern: uuid }, mobile_presence_required: { type: 'boolean', default: false } } } },
   }, async (request, reply) => {
     const auth = credentials(request.headers);
-    const session = await service.start(request.body.adaptive_session_id, request.body.unit_ids[0]!, auth.key, auth.bearer);
+    const session = await service.start(request.body.adaptive_session_id, request.body.unit_ids[0]!, auth.key, auth.bearer, request.body.mobile_presence_required);
     return reply.code(202).send({ data: publicDemo(session) });
   });
 
@@ -44,6 +44,10 @@ export function registerRoutes(app: FastifyInstance, service: DemoService, ready
   app.post<{ Params: { id: string } }>('/demo-streams/:id/stop', {
     schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: demoId } } } },
   }, async (request, reply) => reply.code(202).send({ data: publicDemo(await service.stop(request.params.id, bearer(request.headers))) }));
+
+  app.post<{ Params: { id: string } }>('/demo-streams/:id/heartbeat', {
+    schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: demoId } } } },
+  }, async (request) => ({ data: publicDemo(await service.heartbeat(request.params.id, bearer(request.headers))) }));
 
   app.setErrorHandler((error, _request, reply) => {
     const failure = error instanceof Error ? error : new Error('Unknown failure');

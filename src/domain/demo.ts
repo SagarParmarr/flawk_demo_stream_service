@@ -20,6 +20,8 @@ export interface DemoSession {
   takeoverCount: number;
   selectedStartedAt: string | null;
   selectedDurationSeconds: number | null;
+  selectedExpiresAt: string | null;
+  presenceExpiresAt: string | null;
   nodeStopped: boolean;
   laravelStopped: boolean;
   startedAt: string;
@@ -100,6 +102,8 @@ export function publicDemo(session: DemoSession) {
     playback_url: session.playbackUrl,
     started_at: session.startedAt,
     expires_at: session.expiresAt,
+    selected_expires_at: session.selectedExpiresAt,
+    presence_expires_at: session.presenceExpiresAt,
     error: session.error,
   };
 }

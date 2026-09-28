@@ -43,7 +43,7 @@ export class SqliteDemoRepository implements DemoRepository {
   listNonterminal(): DemoSession[] {
     const rows = this.db.prepare(`SELECT payload FROM demo_sessions WHERE status IN
       ('starting', 'default_live', 'selected_live', 'stopping')`).all() as unknown as Row[];
-    return rows.map((row) => JSON.parse(row.payload) as DemoSession);
+    return rows.map((row) => this.decode(row)!);
   }
 
   create(session: DemoSession): void {
@@ -60,6 +60,6 @@ export class SqliteDemoRepository implements DemoRepository {
   close(): void { this.db.close(); }
 
   private decode(row: Row | undefined): DemoSession | null {
-    return row ? JSON.parse(row.payload) as DemoSession : null;
+    return row ? { selectedExpiresAt: null, presenceExpiresAt: null, ...JSON.parse(row.payload) } as DemoSession : null;
   }
 }

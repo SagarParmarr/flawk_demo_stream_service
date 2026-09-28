@@ -10,6 +10,7 @@ const demo = (id: string, ownerId: number, status: DemoSession['status']): DemoS
   id, ownerId, unitId: 1, adaptiveSessionId: 'capture', goLiveSessionId: null, playbackUrl: null,
   idempotencyKey: id, status, operation: null, assetType: 'default', assetId: null, decisionId: null,
   decisionCursor: 0, priority: 0, takeoverCount: 0, selectedStartedAt: null, selectedDurationSeconds: null,
+  selectedExpiresAt: null, presenceExpiresAt: null,
   nodeStopped: false, laravelStopped: false, startedAt: new Date().toISOString(),
   expiresAt: new Date(Date.now() + 60000).toISOString(), error: null,
 });
@@ -32,4 +33,18 @@ test('SQLite permits one active Demo per owner and persists the decision cursor'
     assert.equal(reopened.listNonterminal().length, 1);
     reopened.close();
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+
+test('legacy JSON payloads normalize deadlines without a schema migration', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'flawk-demo-legacy-'));
+  const repository = new SqliteDemoRepository(path.join(directory, 'demo.sqlite'));
+  try {
+    const legacy = demo('legacy', 4, 'default_live');
+    delete (legacy as Partial<DemoSession>).selectedExpiresAt;
+    delete (legacy as Partial<DemoSession>).presenceExpiresAt;
+    repository.create(legacy);
+    assert.equal(repository.find('legacy')?.selectedExpiresAt, null);
+    assert.equal(repository.listNonterminal()[0]?.presenceExpiresAt, null);
+  } finally { repository.close(); rmSync(directory, { recursive: true, force: true }); }
 });
