@@ -1,3 +1,5 @@
+import { performance } from 'node:perf_hooks';
+import { timed, type TimingContext } from '../observability/timing.js';
 import { randomUUID } from 'node:crypto';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Config } from '../infrastructure/config.js';
@@ -23,6 +25,7 @@ interface Runtime {
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class DemoService {
+  private readonly startupTimings = new Map<string, { start: number; startedAt: string }>();
   private readonly runtimes = new Map<string, Runtime>();
   private readonly loops = new Set<string>();
   private readonly stopping = new Set<string>();
@@ -43,7 +46,8 @@ export class DemoService {
 
   async start(adaptiveSessionId: string, unitId: number, key: string, bearer: string, mobilePresenceRequired = false): Promise<DemoSession> {
     if (this.shuttingDown) throw new DemoError(503, 'Demo service is restarting');
-    const capture = await this.laravel.validate(adaptiveSessionId, bearer);
+    const requestTiming = { start: performance.now(), startedAt: new Date().toISOString() };
+    const capture = await timed(this.log, 'laravel_session_validation', { adaptiveSessionId, unitId }, () => this.laravel.validate(adaptiveSessionId, bearer));
     if (capture.session_id !== adaptiveSessionId || capture.unit_ids.length !== 1 ||
       capture.unit_ids[0] !== unitId || !Number.isInteger(capture.owner_id)) {
       throw new DemoError(422, 'Capture session does not match the selected screen');
@@ -80,12 +84,13 @@ export class DemoService {
       if (concurrent?.adaptiveSessionId === adaptiveSessionId && concurrent.unitId === unitId) return concurrent;
       throw new DemoError(409, 'This owner already has an active Demo');
     }
+    this.startupTimings.set(session.id, requestTiming);
     this.watchDeadlines(session.id);
     this.creatingNodeSession.add(session.id);
     try {
       // The bearer is needed only for these two request-scoped calls. Background
       // provisioning and recovery use service credentials, never a mobile token.
-      const created = await this.node.create(unitId, bearer);
+      const created = await timed(this.log, 'go_live_session_create', this.context(session.id), () => this.node.create(unitId, bearer));
       const current = this.mustFind(session.id);
       current.goLiveSessionId = created.session.public_id;
       current.playbackUrl = created.playback_url;
@@ -159,33 +164,47 @@ export class DemoService {
       [runtime.publisher, runtime.pendingPublisher].filter((publisher): publisher is Publisher => publisher !== null)
         .map((publisher) => publisher.stop())));
     this.runtimes.clear();
+    this.startupTimings.clear();
   }
 
   private async provision(id: string): Promise<void> {
+    await timed(this.log, 'startup_pipeline', this.context(id), async () => {
+      if (!await this.provisionWork(id)) throw new Error('Startup did not reach live');
+    }).catch(() => undefined);
+  }
+
+  private async provisionWork(id: string): Promise<boolean> {
     let cancelHeartbeat: (() => void) | undefined;
     try {
       let session = this.mustFind(id);
-      if (session.status !== 'starting' || !session.goLiveSessionId) return;
+      if (session.status !== 'starting' || !session.goLiveSessionId) return false;
       cancelHeartbeat = this.keepSessionAlive(session.goLiveSessionId, session.ownerId);
-      await this.laravel.bind(session.adaptiveSessionId, session.id, session.goLiveSessionId, session.ownerId, session.unitId);
-      const acquired = await this.node.acquire(session.goLiveSessionId, session.ownerId, session.unitId);
-      const defaultMedia = await this.media.prepare(this.config.defaultS3Uri, 'default');
-      if (this.shuttingDown || this.mustFind(id).status !== 'starting') return;
-      const publisher = await this.ffmpeg.start(defaultMedia.path, defaultMedia.hasAudio, defaultMedia.durationSeconds, acquired.ingest, 0);
-      if (this.shuttingDown) { await publisher.stop(); return; }
+      await timed(this.log, 'laravel_session_bind', this.context(id), () => this.laravel.bind(session.adaptiveSessionId, session.id, session.goLiveSessionId!, session.ownerId, session.unitId));
+      const acquired = await timed(this.log, 'go_live_publisher_acquire', this.context(id), () => this.node.acquire(session.goLiveSessionId!, session.ownerId, session.unitId));
+      const defaultMedia = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.config.defaultS3Uri, 'default', { ...this.context(id), assetType: 'default' }));
+      if (this.shuttingDown || this.mustFind(id).status !== 'starting') return false;
+      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(defaultMedia.path, defaultMedia.hasAudio, defaultMedia.durationSeconds, acquired.ingest, 0, { ...this.context(id), assetType: 'default' }));
+      if (this.shuttingDown) { await publisher.stop(); return false; }
       this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), defaultMedia, switchAbort: null, switchTask: null, restoreTask: null });
-      if (this.mustFind(id).status !== 'starting') { await publisher.stop(); this.runtimes.delete(id); return; }
-      if (this.shuttingDown) return;
-      await this.node.start(session.goLiveSessionId, session.ownerId);
+      if (this.mustFind(id).status !== 'starting') { await publisher.stop(); this.runtimes.delete(id); return false; }
+      if (this.shuttingDown) return false;
+      await timed(this.log, 'ivs_initial_live_confirmation', this.context(id), () => this.node.start(session.goLiveSessionId!, session.ownerId));
       if (!publisher.alive()) throw new Error('Default publisher exited before IVS became live');
-      if (this.mustFind(id).status !== 'starting') { await publisher.stop(); return; }
+      if (this.mustFind(id).status !== 'starting') { await publisher.stop(); return false; }
       session = transition(this.mustFind(id), 'default_live');
       session.operation = null;
       this.repository.save(session);
+      const timing = this.startupTimings.get(id);
+      if (timing) {
+        this.log.info?.({ ...this.context(id), event: 'demo_timing', stage: 'session_request_to_ivs_live', outcome: 'completed',
+          startedAt: timing.startedAt, endedAt: new Date().toISOString(), durationMs: Math.round((performance.now() - timing.start) * 100) / 100 }, 'Demo initial IVS stream confirmed');
+        this.startupTimings.delete(id);
+      }
       await this.reportContent(session);
       this.runLoop(id);
+      return true;
     } catch (error) {
-      if (this.shuttingDown) return;
+      if (this.shuttingDown) return false;
       this.log.error({ demoId: id, error: safeError(error) }, 'Demo startup failed');
       const session = this.repository.find(id);
       if (session && session.status !== 'stopped') {
@@ -193,12 +212,19 @@ export class DemoService {
         this.repository.save(session);
         await this.stopInternal(id, true);
       }
+      return false;
     } finally { cancelHeartbeat?.(); }
   }
 
   private async recoverOne(id: string): Promise<void> {
+    await timed(this.log, 'recovery_pipeline', this.context(id), async () => {
+      if (!await this.recoverOneWork(id)) throw new Error('Recovery did not reach live');
+    }).catch(() => undefined);
+  }
+
+  private async recoverOneWork(id: string): Promise<boolean> {
     let session = this.mustFind(id);
-    if (!session.goLiveSessionId) return;
+    if (!session.goLiveSessionId) return false;
     let cancelHeartbeat: (() => void) | undefined;
     try {
       if (session.takeoverCount >= 90) throw new Error('IVS takeover capacity exhausted');
@@ -207,28 +233,28 @@ export class DemoService {
       this.repository.save(session);
       cancelHeartbeat = this.keepSessionAlive(session.goLiveSessionId, session.ownerId);
       // A restart may happen after Node creation but before Laravel binding.
-      await this.laravel.bind(session.adaptiveSessionId, session.id, session.goLiveSessionId, session.ownerId, session.unitId);
-      const feed = await this.laravel.decisions(session.adaptiveSessionId, session.decisionCursor);
+      await timed(this.log, 'laravel_session_bind', this.context(id), () => this.laravel.bind(session.adaptiveSessionId, session.id, session.goLiveSessionId!, session.ownerId, session.unitId));
+      const feed = await timed(this.log, 'laravel_decision_poll', this.context(id), () => this.laravel.decisions(session.adaptiveSessionId, session.decisionCursor), 'debug');
       if (feed.owner_id !== session.ownerId || feed.unit_ids.length !== 1 || feed.unit_ids[0] !== session.unitId || feed.state === 'STOPPED') {
         throw new Error('Capture session no longer matches Demo');
       }
-      const acquired = await this.node.acquire(session.goLiveSessionId, session.ownerId, session.unitId);
-      const source = await this.media.prepare(this.config.defaultS3Uri, 'default');
-      if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) return;
+      const acquired = await timed(this.log, 'go_live_publisher_acquire', this.context(id), () => this.node.acquire(session.goLiveSessionId!, session.ownerId, session.unitId));
+      const source = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.config.defaultS3Uri, 'default', { ...this.context(id), assetType: 'default' }));
+      if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) return false;
       const priority = session.priority + 1;
-      const baseline = await this.node.status(session.goLiveSessionId, session.ownerId);
-      const publisher = await this.ffmpeg.start(source.path, source.hasAudio, source.durationSeconds, acquired.ingest, priority);
-      if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) { await publisher.stop(); return; }
+      const baseline = await timed(this.log, 'ivs_status_baseline', this.context(id), () => this.node.status(session.goLiveSessionId!, session.ownerId));
+      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(source.path, source.hasAudio, source.durationSeconds, acquired.ingest, priority, { ...this.context(id), assetType: 'default' }));
+      if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) { await publisher.stop(); return false; }
       this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), defaultMedia: source, switchAbort: null, switchTask: null, restoreTask: null });
-      if (this.shuttingDown) return;
+      if (this.shuttingDown) return false;
       if (baseline.is_live) {
-        await waitForTakeover(publisher, () => this.node.status(session.goLiveSessionId!, session.ownerId), baseline);
+        await timed(this.log, 'ivs_takeover_confirmation', this.context(id), () => waitForTakeover(publisher, () => this.node.status(session.goLiveSessionId!, session.ownerId), baseline));
       } else {
-        await this.node.start(session.goLiveSessionId, session.ownerId);
+        await timed(this.log, 'ivs_initial_live_confirmation', this.context(id), () => this.node.start(session.goLiveSessionId!, session.ownerId));
       }
       if (!publisher.alive()) throw new Error('Recovery publisher exited');
       session = this.mustFind(id);
-      if (!['starting', 'default_live', 'selected_live'].includes(session.status)) { await publisher.stop(); return; }
+      if (!['starting', 'default_live', 'selected_live'].includes(session.status)) { await publisher.stop(); return false; }
       session.priority = priority;
       session.takeoverCount += 1;
       session.assetType = 'default';
@@ -242,12 +268,14 @@ export class DemoService {
       this.repository.save(session);
       await this.reportContent(session);
       this.runLoop(id);
+      return true;
     } catch (error) {
-      if (this.shuttingDown) return;
+      if (this.shuttingDown) return false;
       this.log.error({ demoId: id, error: safeError(error) }, 'Demo recovery failed');
       const failed = this.repository.find(id);
       if (failed) { failed.error = 'Demo could not recover'; this.repository.save(failed); }
       await this.stopInternal(id, true);
+      return false;
     } finally { cancelHeartbeat?.(); }
   }
 
@@ -292,7 +320,7 @@ export class DemoService {
 
   private async pollDecisions(id: string): Promise<void> {
     let session = this.mustFind(id);
-    const feed = await this.laravel.decisions(session.adaptiveSessionId, session.decisionCursor);
+    const feed = await timed(this.log, 'laravel_decision_poll', this.context(id), () => this.laravel.decisions(session.adaptiveSessionId, session.decisionCursor), 'debug');
     if (feed.owner_id !== session.ownerId || feed.unit_ids.length !== 1 || feed.unit_ids[0] !== session.unitId) {
       throw new Error('Decision feed identity changed');
     }
@@ -302,6 +330,9 @@ export class DemoService {
     const fresh = feed.decisions.filter((decision) => decision.cycle_number > session.decisionCursor)
       .sort((a, b) => b.cycle_number - a.cycle_number);
     if (!fresh.length) return;
+    for (const decision of fresh) this.log.info?.({ ...this.context(id), event: 'demo_decision_received',
+      receivedAt: new Date().toISOString(), decisionId: decision.decision_id, cycleNumber: decision.cycle_number,
+      result: decision.result, assetId: decision.asset?.id ?? null }, 'Demo decision received');
     // Persist consumption before attempting a switch; recovery never replays a choice.
     session.decisionCursor = fresh[0]!.cycle_number;
     this.repository.save(session);
@@ -326,6 +357,18 @@ export class DemoService {
   }
 
   private async switchSelected(id: string, decision: Decision): Promise<void> {
+    const before = this.mustFind(id);
+    const startedAt = new Date().toISOString();
+    const start = performance.now();
+    await timed(this.log, 'decision_handling', this.context(id, decision), () => this.switchSelectedWork(id, decision));
+    const after = this.mustFind(id);
+    this.log.info?.({ ...this.context(id, decision), event: 'demo_decision_handled', startedAt,
+      endedAt: new Date().toISOString(), durationMs: Math.round((performance.now() - start) * 100) / 100,
+      outcome: after.status === 'selected_live' && after.decisionId === decision.decision_id
+        ? (after.takeoverCount > before.takeoverCount ? 'switched' : 'renewed') : 'skipped' }, 'Demo decision handling result');
+  }
+
+  private async switchSelectedWork(id: string, decision: Decision): Promise<void> {
     if (!decision.asset) return;
     let session = this.mustFind(id);
     if (session.status === 'selected_live' && session.assetId === decision.asset.id && session.operation === null) {
@@ -333,11 +376,13 @@ export class DemoService {
       return;
     }
     // Preparation must not hold the publisher lock or block deadline restoration.
-    const media = await this.media.prepare(decision.asset.s3_uri, decision.decision_id);
+    const media = await timed(this.log, 'selected_media_prepare', this.context(id, decision), () => this.media.prepare(decision.asset!.s3_uri, decision.decision_id, this.context(id, decision)));
     const runtime = this.runtimes.get(id);
     if (!runtime) return;
-    await runtime.restoreTask?.catch(() => undefined);
-    await runtime.switchTask?.catch(() => undefined);
+    await timed(this.log, 'publisher_lock_wait', this.context(id, decision), async () => {
+      await runtime.restoreTask?.catch(() => undefined);
+      await runtime.switchTask?.catch(() => undefined);
+    });
     session = this.mustFind(id);
     if (this.shuttingDown || !['default_live', 'selected_live'].includes(session.status) || !this.validDecision(decision, session)) return;
     if (session.selectedExpiresAt && this.now() >= Date.parse(session.selectedExpiresAt)) return;
@@ -396,7 +441,7 @@ export class DemoService {
     runtime.switchAbort = controller;
     session.operation = type === 'default' ? 'restoring_default' : 'switching_selected';
     this.repository.save(session);
-    const task = this.takeover(id, media, type, assetId, decisionId, controller.signal);
+    const task = timed(this.log, 'asset_transition', { ...this.context(id), assetType: type, assetId, decisionId }, () => this.takeover(id, media, type, assetId, decisionId, controller.signal));
     runtime.switchTask = task;
     try { await task; }
     finally {
@@ -416,14 +461,15 @@ export class DemoService {
     runtime.busy = true;
     let replacement: Publisher | null = null;
     try {
-      const baseline = await abortable(this.node.status(current.goLiveSessionId, current.ownerId), signal);
+      const baseline = await timed(this.log, 'ivs_status_baseline', this.context(id), () => abortable(this.node.status(current.goLiveSessionId!, current.ownerId), signal));
       if (!baseline.is_live) throw new Error('IVS stream is not live');
-      const starting = this.ffmpeg.start(media.path, media.hasAudio, media.durationSeconds, runtime.ingest, current.priority + 1);
+      const switchContext = { ...this.context(id), assetType: type, assetId, decisionId };
+      const starting = timed(this.log, 'ffmpeg_spawn', switchContext, () => this.ffmpeg.start(media.path, media.hasAudio, media.durationSeconds, runtime.ingest, current.priority + 1, switchContext));
       starting.then((publisher) => { if (signal.aborted) void publisher.stop(); }, () => undefined);
       replacement = await abortable(starting, signal);
       if (this.shuttingDown || signal.aborted) { await replacement.stop(); return; }
       runtime.pendingPublisher = replacement;
-      await waitForTakeover(replacement, () => this.node.status(current.goLiveSessionId!, current.ownerId), baseline, 12000, signal);
+      await timed(this.log, 'ivs_takeover_confirmation', switchContext, () => waitForTakeover(replacement!, () => this.node.status(current.goLiveSessionId!, current.ownerId), baseline, 12000, signal));
       const latest = this.mustFind(id);
       if (signal.aborted || this.shuttingDown || !['default_live', 'selected_live'].includes(latest.status)) { await replacement.stop(); return; }
       const previous = runtime.publisher;
@@ -437,8 +483,8 @@ export class DemoService {
       latest.selectedDurationSeconds = type === 'selected' ? media.durationSeconds : null;
       latest.selectedExpiresAt = type === 'selected' ? new Date(this.now() + this.config.selectedAssetHoldSeconds * 1000).toISOString() : null;
       this.repository.save(transition(latest, type === 'selected' ? 'selected_live' : 'default_live'));
-      this.log.info?.({ demoId: id, decisionId, selectedExpiresAt: latest.selectedExpiresAt }, 'Demo source switched');
-      await abortable(previous.stop(), signal);
+      this.log.info?.({ ...switchContext, event: 'demo_source_switched', confirmedAt: new Date().toISOString(), fromAssetType: current.assetType, fromAssetId: current.assetId, selectedExpiresAt: latest.selectedExpiresAt }, 'Demo source switched');
+      await timed(this.log, 'previous_publisher_stop', switchContext, () => abortable(previous.stop(), signal));
       await abortable(this.reportContent(this.mustFind(id)), signal);
     } catch (error) {
       if (replacement && replacement !== runtime.publisher) await replacement.stop();
@@ -448,7 +494,7 @@ export class DemoService {
 
   private async reportContent(session: DemoSession): Promise<void> {
     if (!session.goLiveSessionId) return;
-    try { await this.node.content(session.goLiveSessionId, session.ownerId, session.assetType, session.assetId, session.takeoverCount + 1); }
+    try { await timed(this.log, 'go_live_content_report', this.context(session.id), () => this.node.content(session.goLiveSessionId!, session.ownerId, session.assetType, session.assetId, session.takeoverCount + 1)); }
     catch (error) { this.log.warn({ demoId: session.id, error: safeError(error) }, 'Node content update failed'); }
   }
 
@@ -458,6 +504,7 @@ export class DemoService {
     try {
       let session = this.mustFind(id);
       if (isTerminal(session.status)) return;
+      this.startupTimings.delete(id);
       this.log.info?.({ demoId: id, reason }, 'Demo shutdown requested');
       session = transition(session, 'stopping');
       session.operation = null;
@@ -469,14 +516,14 @@ export class DemoService {
         this.runtimes.delete(id);
       }
       if (session.goLiveSessionId && !session.nodeStopped) {
-        try { await this.node.stop(session.goLiveSessionId, session.ownerId); session.nodeStopped = true; this.repository.save(session); }
+        try { await timed(this.log, 'go_live_session_stop', this.context(id), () => this.node.stop(session.goLiveSessionId!, session.ownerId)); session.nodeStopped = true; this.repository.save(session); }
         catch (error) { this.log.warn({ demoId: id, error: safeError(error) }, 'Node stop will retry'); }
       } else if (!session.goLiveSessionId && !this.creatingNodeSession.has(id)) {
         session.nodeStopped = true;
         this.repository.save(session);
       }
       if (!session.laravelStopped) {
-        try { await this.laravel.stop(session.adaptiveSessionId); session.laravelStopped = true; this.repository.save(session); }
+        try { await timed(this.log, 'laravel_session_stop', this.context(id), () => this.laravel.stop(session.adaptiveSessionId)); session.laravelStopped = true; this.repository.save(session); }
         catch (error) { this.log.warn({ demoId: id, error: safeError(error) }, 'Laravel stop will retry'); }
       }
       if (session.nodeStopped && session.laravelStopped) {
@@ -486,6 +533,14 @@ export class DemoService {
         setTimeout(() => void this.stopInternal(id, failed), 5000).unref();
       }
     } finally { this.stopping.delete(id); }
+  }
+
+  private context(id: string, decision?: Decision): TimingContext {
+    const session = this.repository.find(id);
+    return { demoId: id, adaptiveSessionId: session?.adaptiveSessionId, goLiveSessionId: session?.goLiveSessionId,
+      unitId: session?.unitId, assetType: decision ? 'selected' : session?.assetType,
+      assetId: decision ? decision.asset?.id : session?.assetId, decisionId: decision?.decision_id ?? session?.decisionId,
+      ...(decision ? { cycleNumber: decision.cycle_number } : {}) };
   }
 
   private mustFind(id: string): DemoSession {

@@ -74,8 +74,10 @@ function fixture(decisions: Array<{ decision_id: string; cycle_number: number; r
     calls.publisherStarts++;
     return new FakePublisher(duration);
   } } as PublisherPort;
-  const log = { warn: () => undefined, error: () => undefined } as unknown as FastifyBaseLogger;
-  return { service: new DemoService(config, repo, laravel, node, media, ffmpeg, log, clock), repo, calls, advance, laravel, media, node };
+  const logs: Record<string, unknown>[] = [];
+  const record = (entry: Record<string, unknown>) => { logs.push(entry); };
+  const log = { info: record, debug: record, warn: record, error: record } as unknown as FastifyBaseLogger;
+  return { service: new DemoService(config, repo, laravel, node, media, ffmpeg, log, clock), repo, calls, advance, laravel, media, node, logs };
 }
 
 test('Start is idempotent and Stop ends both downstream sessions', async () => {
@@ -97,7 +99,7 @@ test('selected decision is consumed once, shown live, then restored to default',
   const choice = { decision_id: 'choice-one', cycle_number: 1, result: 'SELECT_ASSET' as const,
     expires_at: new Date(Date.now() + 60000).toISOString(),
     asset: { id: 7, name: 'Selected', s3_uri: 's3://media/selected.mp4' } };
-  const { service, repo, calls, advance } = fixture([choice]);
+  const { service, repo, calls, advance, logs } = fixture([choice]);
   const started = await service.start('capture-two', 1, 'choice-key', 'Bearer token');
   await until(() => repo.find(started.id)?.decisionCursor === 1);
   await until(() => calls.content.includes('selected'));
@@ -105,6 +107,14 @@ test('selected decision is consumed once, shown live, then restored to default',
   await until(() => repo.find(started.id)?.status === 'default_live' && calls.content.filter((type) => type === 'default').length >= 2);
   assert.equal(repo.find(started.id)?.playbackUrl, 'https://ivs.test/one.m3u8');
   assert.equal(repo.find(started.id)?.decisionCursor, 1);
+  for (const stage of ['go_live_session_create', 'go_live_publisher_acquire', 'default_media_prepare',
+    'ffmpeg_spawn', 'ivs_initial_live_confirmation', 'session_request_to_ivs_live', 'selected_media_prepare',
+    'ivs_takeover_confirmation', 'asset_transition']) {
+    assert.ok(logs.some((entry) => entry.stage === stage && entry.outcome === 'completed' && entry.demoId === started.id), stage);
+  }
+  assert.ok(logs.some((entry) => entry.event === 'demo_source_switched' && entry.assetType === 'default' && entry.fromAssetId === 7));
+  assert.ok(logs.some((entry) => entry.event === 'demo_decision_handled' && entry.outcome === 'switched' && entry.decisionId === 'choice-one'));
+  assert.ok(!JSON.stringify(logs).includes('Bearer token'));
   await service.stop(started.id, 'Bearer token');
   await until(() => repo.find(started.id)?.status === 'stopped');
 });

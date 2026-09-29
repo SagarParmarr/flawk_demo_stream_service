@@ -42,3 +42,27 @@ test('heartbeat requires bearer authorization and returns the status envelope', 
     assert.deepEqual(calls, ['Bearer owner']);
   } finally { await app.close(); }
 });
+
+
+test('forwards Retry-After from Laravel 429 responses without changing authorization failures', async () => {
+  const { UpstreamError } = await import('../src/integrations/http.js');
+  for (const retryAfter of ['4', 'Tue, 29 Sep 2026 00:00:08 GMT', null]) {
+    const app = Fastify();
+    const service = { get: async () => { throw new UpstreamError(429, '{}', retryAfter); } } as unknown as DemoService;
+    registerRoutes(app, service, () => true);
+    try {
+      const response = await app.inject({ method: 'GET', url: '/demo-streams/demo_00000000-0000-0000-0000-000000000001', headers: { authorization: 'Bearer owner' } });
+      assert.equal(response.statusCode, 429);
+      assert.equal(response.headers['retry-after'], retryAfter ?? undefined);
+    } finally { await app.close(); }
+  }
+});
+
+test('upstream HTTP client retains Retry-After metadata', async () => {
+  const { requestJson, UpstreamError } = await import('../src/integrations/http.js');
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{}', { status: 429, headers: { 'Retry-After': '8' } });
+  try {
+    await assert.rejects(requestJson('https://example.test/status', {}), (error: unknown) => error instanceof UpstreamError && error.status === 429 && error.retryAfter === '8');
+  } finally { globalThis.fetch = originalFetch; }
+});

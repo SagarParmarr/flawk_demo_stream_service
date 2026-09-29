@@ -18,8 +18,8 @@ const repository = new SqliteDemoRepository(config.databasePath);
 const service = new DemoService(config, repository,
   new LaravelClient(config.laravelBaseUrl, config.laravelSecret),
   new GoLiveClient(config.nodeBaseUrl, config.nodeSecret),
-  new MediaCache(config.cacheDirectory, config.awsPath, config.ffprobePath),
-  new FfmpegFactory(config.ffmpegPath), app.log);
+  new MediaCache(config.cacheDirectory, config.awsPath, config.ffprobePath, app.log),
+  new FfmpegFactory(config.ffmpegPath, app.log), app.log);
 let ready = false;
 registerRoutes(app, service, () => ready);
 

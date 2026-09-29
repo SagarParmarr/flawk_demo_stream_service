@@ -55,6 +55,9 @@ export function registerRoutes(app: FastifyInstance, service: DemoService, ready
       : failure instanceof UpstreamError && failure.status < 500 ? failure.status
         : 'validation' in failure ? 422 : 500;
     if (status >= 500) app.log.error({ errorName: failure.name }, 'Demo request failed');
+    if (status === 429 && failure instanceof UpstreamError && failure.retryAfter) {
+      reply.header('Retry-After', failure.retryAfter);
+    }
     reply.code(status).send({ message: status >= 500 ? 'Demo service is temporarily unavailable' : failure.message });
   });
 }

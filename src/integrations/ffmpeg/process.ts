@@ -1,3 +1,6 @@
+import { performance } from 'node:perf_hooks';
+import type { FastifyBaseLogger } from 'fastify';
+import type { TimingContext } from '../../observability/timing.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { Publisher, PublisherCredentials } from '../../domain/demo.js';
 
@@ -57,15 +60,38 @@ class FfmpegPublisher implements Publisher {
 }
 
 export class FfmpegFactory {
-  constructor(private readonly binary: string) {}
+  constructor(private readonly binary: string, private readonly log?: FastifyBaseLogger) {}
 
   async start(input: string, hasAudio: boolean, durationSeconds: number | null,
-    ingest: PublisherCredentials, priority: number): Promise<Publisher> {
-    const child = spawn(this.binary, ffmpegArgs(input, ingestUrl(ingest, priority), hasAudio), {
-      stdio: ['ignore', 'ignore', 'pipe'], detached: true,
+    ingest: PublisherCredentials, priority: number, context: TimingContext = {}): Promise<Publisher> {
+    const startedAt = new Date().toISOString();
+    const start = performance.now();
+    const args = ffmpegArgs(input, ingestUrl(ingest, priority), hasAudio);
+    const child = spawn(this.binary, ['-progress', 'pipe:3', '-stats_period', '0.5', ...args], {
+      stdio: ['ignore', 'ignore', 'pipe', 'pipe'], detached: true,
     });
     // stderr can contain the ingest URL. Drain it but never write it to logs.
     child.stderr?.resume();
+    // Read only numeric progress; never expose stderr or the RTMPS URL/stream key.
+    const progress = child.stdio[3];
+    let pending = '';
+    let firstFrame = false;
+    if (progress && 'on' in progress) progress.on('data', (chunk: Buffer) => {
+      pending += chunk.toString();
+      const lines = pending.split('\n');
+      pending = (lines.pop() ?? '').slice(-1024);
+      for (const line of lines) {
+        if (!firstFrame && /^frame=\s*[1-9]\d*\s*$/.test(line)) {
+          firstFrame = true;
+          this.log?.info?.({ ...context, event: 'demo_timing', stage: 'ffmpeg_first_encoded_frame',
+            outcome: 'completed', pid: child.pid, priority, startedAt, endedAt: new Date().toISOString(),
+            durationMs: Math.round((performance.now() - start) * 100) / 100 }, 'FFmpeg first encoded frame observed');
+        }
+      }
+    });
+    child.once('exit', (exitCode, signal) => this.log?.info?.({ ...context, event: 'demo_publisher_exit',
+      pid: child.pid, priority, exitCode, signal, firstFrameObserved: firstFrame,
+      endedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start) }, 'Demo FFmpeg publisher exited'));
     await new Promise<void>((resolve, reject) => {
       const onSpawn = () => { child.off('error', onError); resolve(); };
       const onError = (error: Error) => { child.off('spawn', onSpawn); reject(error); };

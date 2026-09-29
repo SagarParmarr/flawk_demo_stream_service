@@ -51,3 +51,49 @@ Mobile clients send `mobile_presence_required: true` on `POST /demo-streams`. Ex
 Status responses additionally include nullable `selected_expires_at` and `presence_expires_at`. These are persisted in SQLite JSON payloads; older records normalize missing fields to null without a table migration. Stop returns 202 and may report `stopping`; clients retain their pending-stop reference until terminal confirmation.
 
 Deploy the backend before distributing the updated mobile client. Local tests do not verify physical auto-lock behavior, background/gesture navigation, real IVS takeover, or HLS playback latency. Validate these on physical iPhone/Android and a target screen with the same session and playback URL through default → selected A → selected B → default. Record shutdown reason, expiry, and failed-switch logs without credentials.
+
+## Timing logs
+
+The service writes structured JSON to stdout through Fastify's logger. Each `demo_timing` span has a `stage`, unique `spanId`, `outcome` (`started`, `completed`, or `failed`), UTC ISO `startedAt`/`endedAt`, and `durationMs`. Durations use a monotonic clock so system clock adjustments do not distort them. Match started and finished records by `spanId`; correlate the pipeline by `demoId`, `adaptiveSessionId`, `goLiveSessionId`, and, for a selection, `decisionId`/`assetId`/`cycleNumber`. Starts remain visible if a process dies before a stage finishes.
+
+| Stage / event | What it measures |
+| --- | --- |
+| `laravel_session_validation` | Laravel capture-session validation API round trip (before a Demo ID exists). |
+| `go_live_session_create` | Go-Live create-session API round trip, including any resource provisioning performed by that endpoint. |
+| `laravel_session_bind` | Binding the capture session to this Demo and Go-Live session. |
+| `go_live_publisher_acquire` | Publisher-credentials API round trip. |
+| `s3_metadata` | Default object's S3 metadata request for cache invalidation. |
+| `demo_media_cache` | `cacheHit: true/false`; a hit skips download. |
+| `s3_download` | AWS CLI download to local cache; only emitted on a cache miss. |
+| `media_probe` | FFprobe process execution to inspect tracks and duration. |
+| `default_media_prepare` / `selected_media_prepare` | Entire preparation, including metadata/download/probe and filesystem work. |
+| `ffmpeg_spawn` | FFmpeg process creation; this alone does not prove successful encoding or ingest. |
+| `ffmpeg_first_encoded_frame` | Process launch to first nonzero frame progress report (sampled every 0.5 seconds). Encoding and RTMPS publishing run continuously; this is not a separate complete-file conversion or confirmation of IVS receipt. |
+| `ivs_initial_live_confirmation` | Go-Live start API round trip, which confirms initial IVS activation. |
+| `session_request_to_ivs_live` | Initial successful request, including validation and session creation, through confirmed default IVS playback; emitted before content reporting. Reused sessions do not emit a new startup duration. |
+| `startup_pipeline` / `recovery_pipeline` | Background startup/recovery, through content reporting and launching decision polling. Startup excludes the preceding validation/create calls. |
+| `laravel_decision_poll` | Decision-feed API round trip; debug level to avoid logging every idle poll at info level. |
+| `demo_decision_received` | UTC arrival time, result, cycle and asset IDs for each fresh decision. |
+| `decision_handling` / `demo_decision_handled` | Handling a choice after feed receipt, including preparation, waiting and switching. The result event distinguishes `switched`, `renewed` (same asset, no new publisher) and `skipped`; a completed handling span alone does not prove a switch. |
+| `publisher_lock_wait` | Waiting for earlier switch/restoration tasks after preparation. |
+| `ivs_status_baseline` | Pre-switch IVS status API round trip. |
+| `ivs_takeover_confirmation` | Waiting/polling for a new IVS takeover event after replacement FFmpeg spawn. |
+| `demo_source_switched` | `confirmedAt` for authoritative switch, with previous and new asset IDs/types. |
+| `asset_transition` | Switch start through baseline, spawn, confirmation, old publisher stop and content reporting; excludes S3 preparation. Includes return to cached default. |
+| `previous_publisher_stop` / `go_live_content_report` | Old publisher shutdown and reporting current content to Go-Live. |
+| `go_live_session_stop` / `laravel_session_stop` | Downstream stop API round trips (including retry attempts). |
+| `demo_publisher_exit` | Process lifetime, exit code/signal, and whether any encoded frame was observed. |
+
+Nested durations overlap: do not add a pipeline span to its child spans. Use `demo_decision_received.receivedAt` and `demo_source_switched.confirmedAt` to see choice arrival → confirmed asset takeover. Use successive switch timestamps to measure how long each asset stayed active. Failed stages log elapsed time and only the error class; existing error logs indicate the affected workflow. Interrupted startup/recovery does not report a completed pipeline.
+
+Locally, logs appear in the terminal running `npm run dev` or `npm run start:prod`. With the supplied systemd unit:
+
+```sh
+journalctl -u flawk-demo.service -f -o cat
+# Filter one Demo's events (replace the ID):
+journalctl -u flawk-demo.service --since '30 minutes ago' -o cat | jq -R 'fromjson? | select(.demoId == "demo_YOUR_ID")'
+```
+
+Info logs are enabled by default. Set `LOG_LEVEL=debug` in the service environment and restart it when individual polling timings are needed. These changes do not install a file logger or log collector. Retention follows the terminal/process manager/journald configuration.
+
+Measurement boundaries: Laravel currently returns no inference start/end or decision-created timestamp, so this service cannot measure capture → LLM decision or feed-delivery lag. The Go-Live endpoint durations do not isolate AWS channel creation from its other work or indicate whether a channel was reused. Those timings require instrumentation in Laravel and the Go-Live backend. IVS confirmation does not measure when an HLS player displays the frame; that requires player-side instrumentation. No bearer tokens, S3 URLs/keys, ingest URLs, stream keys, raw error messages, or FFmpeg stderr are added to these logs.

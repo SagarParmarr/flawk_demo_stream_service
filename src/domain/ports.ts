@@ -1,3 +1,4 @@
+import type { TimingContext } from '../observability/timing.js';
 import type { CaptureSession, Decision, Publisher, PublisherCredentials } from './demo.js';
 
 export interface LaravelPort {
@@ -22,10 +23,10 @@ export interface GoLivePort {
 }
 
 export interface MediaPort {
-  prepare(uri: string, version: string): Promise<{ path: string; hasAudio: boolean; durationSeconds: number }>;
+  prepare(uri: string, version: string, context?: TimingContext): Promise<{ path: string; hasAudio: boolean; durationSeconds: number }>;
 }
 
 export interface PublisherPort {
   start(input: string, hasAudio: boolean, durationSeconds: number | null,
-    ingest: PublisherCredentials, priority: number): Promise<Publisher>;
+    ingest: PublisherCredentials, priority: number, context?: TimingContext): Promise<Publisher>;
 }
