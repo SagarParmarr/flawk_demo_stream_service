@@ -33,8 +33,9 @@ export interface Decision {
   decision_id: string;
   cycle_number: number;
   result: 'SELECT_ASSET' | 'NO_DECISION';
+  decided_at?: string | null;
   expires_at: string | null;
-  asset: { id: number; name: string; s3_uri: string } | null;
+  asset: { id: number; name: string; s3_uri: string; media_profile?: string | null } | null;
 }
 
 export interface CaptureSession {
@@ -52,6 +53,14 @@ export interface PublisherCredentials {
 export interface GoLiveSession {
   public_id: string;
   playback_url: string;
+}
+
+export interface PreparedMedia {
+  path: string;
+  hasAudio: boolean;
+  durationSeconds: number;
+  publishMode: 'copy' | 'encode';
+  mediaProfile: string | null;
 }
 
 export interface Publisher {

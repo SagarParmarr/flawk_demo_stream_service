@@ -1,5 +1,13 @@
 import type { Publisher } from '../domain/demo.js';
 import type { PublisherStatus } from '../integrations/go-live/client.js';
+import { performance } from 'node:perf_hooks';
+
+export interface TakeoverProbe {
+  attempt: number;
+  requestDurationMs: number;
+  elapsedMs: number;
+  result: 'pending' | 'confirmed' | 'failed';
+}
 
 function eventKey(event: PublisherStatus['events'][number]): string {
   return `${event.name ?? ''}\0${event.code ?? ''}\0${event.event_time ?? ''}`;
@@ -35,13 +43,19 @@ export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> 
 }
 
 export async function waitForTakeover(replacement: Publisher,
-  status: () => Promise<PublisherStatus>, baseline: PublisherStatus, timeoutMs = 12000, signal?: AbortSignal): Promise<void> {
+  status: () => Promise<PublisherStatus>, baseline: PublisherStatus, timeoutMs = 12000, signal?: AbortSignal,
+  onProbe?: (probe: TakeoverProbe) => void): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  const started = performance.now();
+  let attempt = 0;
   while (Date.now() < deadline) {
     if (!replacement.alive()) throw new Error('Replacement publisher exited before takeover');
     if (signal?.aborted) throw new Error('Publisher operation cancelled');
+    const requestStarted = performance.now();
     const current = signal ? await abortable(status(), signal) : await status();
     const outcome = takeoverResult(current, baseline);
+    onProbe?.({ attempt: ++attempt, requestDurationMs: Math.round((performance.now() - requestStarted) * 100) / 100,
+      elapsedMs: Math.round((performance.now() - started) * 100) / 100, result: outcome });
     if (outcome === 'confirmed') return;
     if (outcome === 'failed') throw new Error('IVS rejected publisher takeover');
     const delay = new Promise<void>((resolve) => setTimeout(resolve, 750));

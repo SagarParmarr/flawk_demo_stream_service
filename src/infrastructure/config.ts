@@ -13,6 +13,7 @@ export interface Config {
   ffmpegPath: string;
   ffprobePath: string;
   awsPath: string;
+  ingestKeyframeInterval: number | null;
   pollIntervalMs: number;
   heartbeatIntervalMs: number;
   maxDemoDurationMs: number;
@@ -55,6 +56,8 @@ export function loadConfig(): Config {
     ffmpegPath: process.env.FFMPEG_PATH ?? 'ffmpeg',
     ffprobePath: process.env.FFPROBE_PATH ?? 'ffprobe',
     awsPath: process.env.AWS_PATH ?? 'aws',
+    ingestKeyframeInterval: process.env.IVS_INGEST_KEYFRAME_INTERVAL_SECONDS?.trim()
+      ? integer('IVS_INGEST_KEYFRAME_INTERVAL_SECONDS', 2, 2, 6) : null,
     pollIntervalMs: integer('POLL_INTERVAL_MS', 2000, 500, 30000),
     heartbeatIntervalMs: integer('HEARTBEAT_INTERVAL_MS', 30000, 5000, 60000),
     maxDemoDurationMs: integer('MAX_DEMO_DURATION_MS', 1800000, 60000, 1800000),

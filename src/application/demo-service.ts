@@ -1,3 +1,4 @@
+import type { PreparedMedia } from '../domain/demo.js';
 import { performance } from 'node:perf_hooks';
 import { timed, type TimingContext } from '../observability/timing.js';
 import { randomUUID } from 'node:crypto';
@@ -17,7 +18,9 @@ interface Runtime {
   ingest: PublisherCredentials;
   busy: boolean;
   lastHeartbeat: number;
-  defaultMedia: { path: string; hasAudio: boolean; durationSeconds: number };
+  lastDecisionPollCompletedAt: number | null;
+  defaultMedia: PreparedMedia;
+  selectedSourceUri: string | null;
   switchAbort: AbortController | null;
   switchTask: Promise<void> | null;
   restoreTask: Promise<void> | null;
@@ -183,9 +186,9 @@ export class DemoService {
       const acquired = await timed(this.log, 'go_live_publisher_acquire', this.context(id), () => this.node.acquire(session.goLiveSessionId!, session.ownerId, session.unitId));
       const defaultMedia = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.config.defaultS3Uri, 'default', { ...this.context(id), assetType: 'default' }));
       if (this.shuttingDown || this.mustFind(id).status !== 'starting') return false;
-      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(defaultMedia.path, defaultMedia.hasAudio, defaultMedia.durationSeconds, acquired.ingest, 0, { ...this.context(id), assetType: 'default' }));
+      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(defaultMedia.path, defaultMedia.hasAudio, defaultMedia.durationSeconds, acquired.ingest, 0, { ...this.context(id), assetType: 'default' }, defaultMedia.publishMode));
       if (this.shuttingDown) { await publisher.stop(); return false; }
-      this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), defaultMedia, switchAbort: null, switchTask: null, restoreTask: null });
+      this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), lastDecisionPollCompletedAt: null, defaultMedia, selectedSourceUri: null, switchAbort: null, switchTask: null, restoreTask: null });
       if (this.mustFind(id).status !== 'starting') { await publisher.stop(); this.runtimes.delete(id); return false; }
       if (this.shuttingDown) return false;
       await timed(this.log, 'ivs_initial_live_confirmation', this.context(id), () => this.node.start(session.goLiveSessionId!, session.ownerId));
@@ -243,12 +246,14 @@ export class DemoService {
       if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) return false;
       const priority = session.priority + 1;
       const baseline = await timed(this.log, 'ivs_status_baseline', this.context(id), () => this.node.status(session.goLiveSessionId!, session.ownerId));
-      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(source.path, source.hasAudio, source.durationSeconds, acquired.ingest, priority, { ...this.context(id), assetType: 'default' }));
+      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(source.path, source.hasAudio, source.durationSeconds, acquired.ingest, priority, { ...this.context(id), assetType: 'default' }, source.publishMode));
       if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) { await publisher.stop(); return false; }
-      this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), defaultMedia: source, switchAbort: null, switchTask: null, restoreTask: null });
+      this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), lastDecisionPollCompletedAt: null, defaultMedia: source, selectedSourceUri: null, switchAbort: null, switchTask: null, restoreTask: null });
       if (this.shuttingDown) return false;
       if (baseline.is_live) {
-        await timed(this.log, 'ivs_takeover_confirmation', this.context(id), () => waitForTakeover(publisher, () => this.node.status(session.goLiveSessionId!, session.ownerId), baseline));
+        await timed(this.log, 'ivs_takeover_confirmation', this.context(id), () => waitForTakeover(publisher,
+          () => this.node.status(session.goLiveSessionId!, session.ownerId), baseline, 12000, undefined,
+          (probe) => this.log.info?.({ ...this.context(id), event: 'demo_ivs_takeover_probe', ...probe }, 'Demo IVS takeover probe')));
       } else {
         await timed(this.log, 'ivs_initial_live_confirmation', this.context(id), () => this.node.start(session.goLiveSessionId!, session.ownerId));
       }
@@ -320,7 +325,14 @@ export class DemoService {
 
   private async pollDecisions(id: string): Promise<void> {
     let session = this.mustFind(id);
+    const runtime = this.runtimes.get(id);
+    const pollStarted = performance.now();
+    const pollStartedAt = new Date().toISOString();
+    const sincePriorPollCompletedMs = runtime?.lastDecisionPollCompletedAt === null || runtime?.lastDecisionPollCompletedAt === undefined
+      ? null : Math.round((pollStarted - runtime.lastDecisionPollCompletedAt) * 100) / 100;
     const feed = await timed(this.log, 'laravel_decision_poll', this.context(id), () => this.laravel.decisions(session.adaptiveSessionId, session.decisionCursor), 'debug');
+    const pollRequestMs = Math.round((performance.now() - pollStarted) * 100) / 100;
+    if (runtime) runtime.lastDecisionPollCompletedAt = performance.now();
     if (feed.owner_id !== session.ownerId || feed.unit_ids.length !== 1 || feed.unit_ids[0] !== session.unitId) {
       throw new Error('Decision feed identity changed');
     }
@@ -330,9 +342,18 @@ export class DemoService {
     const fresh = feed.decisions.filter((decision) => decision.cycle_number > session.decisionCursor)
       .sort((a, b) => b.cycle_number - a.cycle_number);
     if (!fresh.length) return;
-    for (const decision of fresh) this.log.info?.({ ...this.context(id), event: 'demo_decision_received',
-      receivedAt: new Date().toISOString(), decisionId: decision.decision_id, cycleNumber: decision.cycle_number,
-      result: decision.result, assetId: decision.asset?.id ?? null }, 'Demo decision received');
+    for (const decision of fresh) {
+      const decidedMs = Date.parse(decision.decided_at ?? '');
+      const generatedMs = Date.parse(feed.generated_at ?? '');
+      this.log.info?.({ ...this.context(id), event: 'demo_decision_received',
+        receivedAt: new Date().toISOString(), decisionId: decision.decision_id, cycleNumber: decision.cycle_number,
+        result: decision.result, assetId: decision.asset?.id ?? null, decidedAt: decision.decided_at ?? null,
+        feedGeneratedAt: feed.generated_at ?? null,
+        decisionToFeedMs: Number.isFinite(decidedMs) && Number.isFinite(generatedMs) && generatedMs >= decidedMs
+          ? generatedMs - decidedMs : null,
+        pollStartedAt, pollRequestMs, sincePriorPollCompletedMs,
+        configuredPollIntervalMs: this.config.pollIntervalMs, decisionsInResponse: fresh.length }, 'Demo decision received');
+    }
     // Persist consumption before attempting a switch; recovery never replays a choice.
     session.decisionCursor = fresh[0]!.cycle_number;
     this.repository.save(session);
@@ -343,7 +364,7 @@ export class DemoService {
   private validDecision(decision: Decision, session: DemoSession): boolean {
     if (decision.result !== 'SELECT_ASSET' || !decision.asset) return false;
     if (decision.decision_id === session.decisionId) return false;
-    if (decision.asset.id !== session.assetId && !hasSelectedCapacity(session.takeoverCount)) return false;
+    if ((decision.asset.id !== session.assetId || this.runtimes.get(session.id)?.selectedSourceUri !== decision.asset.s3_uri) && !hasSelectedCapacity(session.takeoverCount)) return false;
     if (decision.expires_at && (!Number.isFinite(Date.parse(decision.expires_at)) || Date.parse(decision.expires_at) <= this.now())) return false;
     return /^s3:\/\/[^/]+\/.+\.mp4$/i.test(decision.asset.s3_uri);
   }
@@ -371,12 +392,12 @@ export class DemoService {
   private async switchSelectedWork(id: string, decision: Decision): Promise<void> {
     if (!decision.asset) return;
     let session = this.mustFind(id);
-    if (session.status === 'selected_live' && session.assetId === decision.asset.id && session.operation === null) {
+    if (session.status === 'selected_live' && session.assetId === decision.asset.id && this.runtimes.get(id)?.selectedSourceUri === decision.asset.s3_uri && session.operation === null) {
       this.renewSelection(session, decision.decision_id);
       return;
     }
     // Preparation must not hold the publisher lock or block deadline restoration.
-    const media = await timed(this.log, 'selected_media_prepare', this.context(id, decision), () => this.media.prepare(decision.asset!.s3_uri, decision.decision_id, this.context(id, decision)));
+    const media = await timed(this.log, 'selected_media_prepare', this.context(id, decision), () => this.media.prepare(decision.asset!.s3_uri, decision.decision_id, this.context(id, decision), decision.asset!.media_profile));
     const runtime = this.runtimes.get(id);
     if (!runtime) return;
     await timed(this.log, 'publisher_lock_wait', this.context(id, decision), async () => {
@@ -386,7 +407,10 @@ export class DemoService {
     session = this.mustFind(id);
     if (this.shuttingDown || !['default_live', 'selected_live'].includes(session.status) || !this.validDecision(decision, session)) return;
     if (session.selectedExpiresAt && this.now() >= Date.parse(session.selectedExpiresAt)) return;
-    await this.switchPublisher(id, media, 'selected', decision.asset.id, decision.decision_id);
+    try { await this.switchPublisher(id, media, 'selected', decision.asset.id, decision.decision_id); }
+    finally {
+      if (this.repository.find(id)?.decisionId === decision.decision_id) runtime.selectedSourceUri = decision.asset.s3_uri;
+    }
   }
 
   private watchDeadlines(id: string): void {
@@ -431,7 +455,7 @@ export class DemoService {
     this.watchdogs.set(id, timer);
   }
 
-  private async switchPublisher(id: string, media: { path: string; hasAudio: boolean; durationSeconds: number },
+  private async switchPublisher(id: string, media: PreparedMedia,
     type: 'default' | 'selected', assetId: number | null, decisionId: string | null): Promise<void> {
     const runtime = this.runtimes.get(id);
     const session = this.mustFind(id);
@@ -453,23 +477,25 @@ export class DemoService {
     }
   }
 
-  private async takeover(id: string, media: { path: string; hasAudio: boolean; durationSeconds: number },
+  private async takeover(id: string, media: PreparedMedia,
     type: 'default' | 'selected', assetId: number | null, decisionId: string | null, signal: AbortSignal): Promise<void> {
     const current = this.mustFind(id);
     const runtime = this.runtimes.get(id);
     if (!runtime || !current.goLiveSessionId || runtime.busy) throw new Error('Publisher is unavailable');
     runtime.busy = true;
     let replacement: Publisher | null = null;
+    const switchContext = { ...this.context(id), assetType: type, assetId, decisionId };
     try {
-      const baseline = await timed(this.log, 'ivs_status_baseline', this.context(id), () => abortable(this.node.status(current.goLiveSessionId!, current.ownerId), signal));
+      const baseline = await timed(this.log, 'ivs_status_baseline', switchContext, () => abortable(this.node.status(current.goLiveSessionId!, current.ownerId), signal));
       if (!baseline.is_live) throw new Error('IVS stream is not live');
-      const switchContext = { ...this.context(id), assetType: type, assetId, decisionId };
-      const starting = timed(this.log, 'ffmpeg_spawn', switchContext, () => this.ffmpeg.start(media.path, media.hasAudio, media.durationSeconds, runtime.ingest, current.priority + 1, switchContext));
+      const starting = timed(this.log, 'ffmpeg_spawn', switchContext, () => this.ffmpeg.start(media.path, media.hasAudio, media.durationSeconds, runtime.ingest, current.priority + 1, switchContext, media.publishMode));
       starting.then((publisher) => { if (signal.aborted) void publisher.stop(); }, () => undefined);
       replacement = await abortable(starting, signal);
       if (this.shuttingDown || signal.aborted) { await replacement.stop(); return; }
       runtime.pendingPublisher = replacement;
-      await timed(this.log, 'ivs_takeover_confirmation', switchContext, () => waitForTakeover(replacement!, () => this.node.status(current.goLiveSessionId!, current.ownerId), baseline, 12000, signal));
+      await timed(this.log, 'ivs_takeover_confirmation', switchContext, () => waitForTakeover(replacement!,
+        () => this.node.status(current.goLiveSessionId!, current.ownerId), baseline, 12000, signal,
+        (probe) => this.log.info?.({ ...switchContext, event: 'demo_ivs_takeover_probe', ...probe }, 'Demo IVS takeover probe')));
       const latest = this.mustFind(id);
       if (signal.aborted || this.shuttingDown || !['default_live', 'selected_live'].includes(latest.status)) { await replacement.stop(); return; }
       const previous = runtime.publisher;
@@ -477,13 +503,16 @@ export class DemoService {
       latest.priority += 1;
       latest.takeoverCount += 1;
       latest.assetType = type;
+      if (type === 'default') runtime.selectedSourceUri = null;
       latest.assetId = assetId;
       latest.decisionId = decisionId;
       latest.selectedStartedAt = type === 'selected' ? new Date(this.now()).toISOString() : null;
       latest.selectedDurationSeconds = type === 'selected' ? media.durationSeconds : null;
       latest.selectedExpiresAt = type === 'selected' ? new Date(this.now() + this.config.selectedAssetHoldSeconds * 1000).toISOString() : null;
       this.repository.save(transition(latest, type === 'selected' ? 'selected_live' : 'default_live'));
-      this.log.info?.({ ...switchContext, event: 'demo_source_switched', confirmedAt: new Date().toISOString(), fromAssetType: current.assetType, fromAssetId: current.assetId, selectedExpiresAt: latest.selectedExpiresAt }, 'Demo source switched');
+      this.log.info?.({ ...switchContext, event: 'demo_source_switched', confirmedAt: new Date().toISOString(),
+        sourceVersion: latest.takeoverCount + 1, fromAssetType: current.assetType,
+        fromAssetId: current.assetId, selectedExpiresAt: latest.selectedExpiresAt }, 'Demo source switched');
       await timed(this.log, 'previous_publisher_stop', switchContext, () => abortable(previous.stop(), signal));
       await abortable(this.reportContent(this.mustFind(id)), signal);
     } catch (error) {

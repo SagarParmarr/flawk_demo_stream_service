@@ -1,0 +1,30 @@
+[Unit]
+Description=Flawk Node Media Preparation Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flawk-demo
+Group=flawk-demo
+WorkingDirectory=/opt/flawk/flawk_demo_stream_service
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/flawk-demo/media.env
+ExecStart=/usr/bin/node dist/src/media-worker.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+StateDirectory=flawk-media
+CacheDirectory=flawk-media
+Nice=10
+CPUQuota=50%
+MemoryMax=768M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/flawk-media /var/cache/flawk-media
+
+[Install]
+WantedBy=multi-user.target

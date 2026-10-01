@@ -1,6 +1,6 @@
 # Flawk Demo Stream Service
 
-Backend-only coordinator for one-screen, one-frame Demo sessions. Laravel owns capture and LLM decisions; Node owns Go-Live sessions and IVS; this service owns FFmpeg publishing and takeover. No browser UI or stream key is exposed to mobile.
+Backend-only coordinator for one-screen, one-frame Demo sessions. Laravel owns capture and LLM decisions; Node owns Go-Live sessions and IVS; this service owns offline FFmpeg preparation, prepared S3 uploads, publishing and takeover. No browser UI or stream key is exposed to mobile.
 
 ## Flow
 
@@ -25,7 +25,7 @@ Run `npm ci`, `npm run check`, `npm test`, and `npm run build` with Node 22.13 o
 
 ## Required configuration
 
-Copy `.env.example` into managed server configuration. `DEMO_STREAM_SERVICE_SECRET` must match Laravel, and `GO_LIVE_ADAPTIVE_INTERNAL_SECRET` must match Node; both must be at least 32 characters and come from managed secrets storage. Keep `HOST=127.0.0.1` behind an HTTPS reverse proxy. Give the EC2 instance role read access only to the configured media bucket. The service uses AWS CLI, FFmpeg, and ffprobe on `PATH`.
+Copy `.env.example` into managed server configuration. `DEMO_STREAM_SERVICE_SECRET` must match Laravel, and `GO_LIVE_ADAPTIVE_INTERNAL_SECRET` must match Node; both must be at least 32 characters and come from managed secrets storage. Keep `HOST=127.0.0.1` behind an HTTPS reverse proxy. Give the publisher role read access to its media bucket. The separate media worker also needs scoped upload/delete permissions for prepared outputs. The service uses AWS CLI, FFmpeg, and ffprobe on `PATH`.
 
 In the mobile build, set `EXPO_PUBLIC_DEMO_STREAM_ENABLED=true` and `EXPO_PUBLIC_DEMO_STREAM_API_BASE_URL=https://<dedicated-hostname>`. The URL must be HTTPS. Until both are set, the existing Demo path stays active. Disable `ADAPTIVE_IVS_PLAYOUT_ENABLED` in Laravel for EC2-owned sessions, and deploy the Laravel binding/decision routes and Node internal publisher routes before enabling the mobile flag.
 
@@ -74,10 +74,12 @@ The service writes structured JSON to stdout through Fastify's logger. Each `dem
 | `startup_pipeline` / `recovery_pipeline` | Background startup/recovery, through content reporting and launching decision polling. Startup excludes the preceding validation/create calls. |
 | `laravel_decision_poll` | Decision-feed API round trip; debug level to avoid logging every idle poll at info level. |
 | `demo_decision_received` | UTC arrival time, result, cycle and asset IDs for each fresh decision. |
+| `demo_decision_received.decidedAt` / `.feedGeneratedAt` | Laravel decision creation and feed-generation timestamps when the additive Laravel feed fields are deployed. `decisionToFeedMs` compares those two Laravel timestamps without cross-host clock skew. Comparing either to EC2 arrival requires synchronized host clocks. `pollRequestMs` and `sincePriorPollCompletedMs` split the feed request from the interval between requests; `configuredPollIntervalMs` shows the intended sleep. |
 | `decision_handling` / `demo_decision_handled` | Handling a choice after feed receipt, including preparation, waiting and switching. The result event distinguishes `switched`, `renewed` (same asset, no new publisher) and `skipped`; a completed handling span alone does not prove a switch. |
 | `publisher_lock_wait` | Waiting for earlier switch/restoration tasks after preparation. |
 | `ivs_status_baseline` | Pre-switch IVS status API round trip. |
 | `ivs_takeover_confirmation` | Waiting/polling for a new IVS takeover event after replacement FFmpeg spawn. |
+| `demo_ivs_takeover_probe` | Each IVS status check during confirmation: attempt number, API request time, total elapsed time and pending/confirmed/failed result. These checks are inside `ivs_takeover_confirmation`; do not sum them with that stage. |
 | `demo_source_switched` | `confirmedAt` for authoritative switch, with previous and new asset IDs/types. |
 | `asset_transition` | Switch start through baseline, spawn, confirmation, old publisher stop and content reporting; excludes S3 preparation. Includes return to cached default. |
 | `previous_publisher_stop` / `go_live_content_report` | Old publisher shutdown and reporting current content to Go-Live. |
@@ -96,4 +98,14 @@ journalctl -u flawk-demo.service --since '30 minutes ago' -o cat | jq -R 'fromjs
 
 Info logs are enabled by default. Set `LOG_LEVEL=debug` in the service environment and restart it when individual polling timings are needed. These changes do not install a file logger or log collector. Retention follows the terminal/process manager/journald configuration.
 
-Measurement boundaries: Laravel currently returns no inference start/end or decision-created timestamp, so this service cannot measure capture → LLM decision or feed-delivery lag. The Go-Live endpoint durations do not isolate AWS channel creation from its other work or indicate whether a channel was reused. Those timings require instrumentation in Laravel and the Go-Live backend. IVS confirmation does not measure when an HLS player displays the frame; that requires player-side instrumentation. No bearer tokens, S3 URLs/keys, ingest URLs, stream keys, raw error messages, or FFmpeg stderr are added to these logs.
+Measurement boundaries: Laravel logs candidate preparation, frame reads, model attempts, decision persistence and feed generation; the decision feed adds `decided_at` and `generated_at`. Compare those timestamps with this service's receipt time only when the two hosts' clocks are synchronized. The Go-Live endpoint durations do not isolate AWS channel creation from its other work or indicate whether a channel was reused. IVS confirmation does not measure when an HLS player displays the frame. The screen app logs when it polls a new source version and the next rendered frame, but a stable HLS stream cannot identify the exact first frame of a particular asset without an in-band content marker. No bearer tokens, S3 URLs/keys, ingest URLs, stream keys, raw error messages, or FFmpeg stderr are added to these logs.
+
+For an end-to-end trace, the mobile capture screen logs `demo_mobile_capture_tick` for scheduled/actual tick delay and skip reason, plus `demo_mobile_timing` for batch creation, camera capture, JPEG processing, upload, frame confirmation, decision completion, and the whole capture cycle. Match mobile and Laravel records by `batchId`/`batch_id`, then Laravel and coordinator records by `decision_id`, and coordinator and screen records by `assetId` plus `sourceVersion`. Mobile logs appear in the device/Metro console, Laravel logs in its configured log channel, coordinator logs in journald, and screen logs in that browser's console. Deploy the additive Laravel feed fields before the coordinator, then deploy the screen and mobile clients. The screen's next frame after a version update is only a proxy for asset display; exact asset-frame attribution needs an in-band marker.
+
+### Square prepared assets
+
+See [square media rollout](docs/square-media-rollout.md). Verified `square800-v1` assets use stream copy; legacy assets use 800×800 fill-and-crop encoding without padding. A separate Node media worker in this repo processes durable Laravel pending records. Laravel handles upload, crop settings, status and preview; enable `ADAPTIVE_MEDIA_NODE_ENABLED` during the coordinated rollout.
+
+## Node media worker
+
+Run `npm run media:dev` locally with worker configuration in `.env`, or build and run `npm run media:prod` under supervision. Use `.env.media.example` and `deploy/flawk-media-worker.service` for the standalone worker; it needs no Go-Live/IVS credentials. One background conversion runs at a time, outside the live switch path. See the [media rollout and timing stages](docs/square-media-rollout.md) for leases, retries, bucket permissions, migration flag and deployment order.

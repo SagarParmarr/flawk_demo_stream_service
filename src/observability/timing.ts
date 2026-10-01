@@ -12,6 +12,8 @@ export interface TimingContext {
   assetId?: number | null;
   decisionId?: string | null;
   cycleNumber?: number;
+  generation?: string;
+  attempt?: number;
 }
 
 export async function timed<T>(log: FastifyBaseLogger | undefined, stage: string,

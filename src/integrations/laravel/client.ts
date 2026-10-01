@@ -2,7 +2,7 @@ import type { CaptureSession, Decision } from '../../domain/demo.js';
 import { requestJson } from '../http.js';
 
 interface Data<T> { data: T }
-interface Feed { owner_id: number; unit_ids: number[]; state: string; decisions: Decision[] }
+interface Feed { owner_id: number; unit_ids: number[]; state: string; generated_at?: string; decisions: Decision[] }
 
 export class LaravelClient {
   constructor(private readonly baseUrl: string, private readonly secret: string) {}

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { FastifyBaseLogger } from 'fastify';
 import { DemoService, DemoError } from '../src/application/demo-service.js';
-import type { DemoRepository, DemoSession, Publisher } from '../src/domain/demo.js';
+import type { Decision, DemoRepository, DemoSession, Publisher } from '../src/domain/demo.js';
 import type { Config } from '../src/infrastructure/config.js';
 import type { LaravelPort, GoLivePort, MediaPort, PublisherPort } from '../src/domain/ports.js';
 
@@ -33,7 +33,7 @@ async function until(check: () => boolean): Promise<void> {
   assert.ok(check(), 'expected state was not reached');
 }
 
-function fixture(decisions: Array<{ decision_id: string; cycle_number: number; result: 'SELECT_ASSET' | 'NO_DECISION'; expires_at: string | null; asset: { id: number; name: string; s3_uri: string } | null }> = [],
+function fixture(decisions: Decision[] = [],
   failure?: 'node-create' | 'slow-create' | 'download' | 'takeover') {
   let offset = 0;
   const clock = () => Date.now() + offset;
@@ -44,7 +44,7 @@ function fixture(decisions: Array<{ decision_id: string; cycle_number: number; r
   const laravel = {
     validate: async (id: string) => ({ session_id: id, owner_id: 4, unit_ids: [1], state: 'READY_FOR_CAPTURE' }),
     bind: async () => undefined,
-    decisions: async () => ({ owner_id: 4, unit_ids: [1], state: 'COMPLETE', decisions }),
+    decisions: async () => ({ owner_id: 4, unit_ids: [1], state: 'COMPLETE', generated_at: new Date().toISOString(), decisions }),
     stop: async () => { calls.stoppedLaravel++; },
   } as LaravelPort;
   const node = {
@@ -67,7 +67,7 @@ function fixture(decisions: Array<{ decision_id: string; cycle_number: number; r
     heartbeatIntervalMs: 5000, maxDemoDurationMs: 600000, selectedAssetHoldSeconds: 30 } as Config;
   const media = { prepare: async (uri: string) => {
     if (failure === 'download' && !uri.includes('default')) throw new Error('S3 unavailable');
-    return { path: uri, hasAudio: true, durationSeconds: uri.includes('default') ? 10 : 0.1 };
+    return { path: uri, hasAudio: true, publishMode: 'encode', mediaProfile: null, durationSeconds: uri.includes('default') ? 10 : 0.1 };
   } } as MediaPort;
   const ffmpeg = { start: async (_path: string, _audio: boolean, duration: number) => {
     publisherStarts++;
@@ -97,6 +97,7 @@ test('Start is idempotent and Stop ends both downstream sessions', async () => {
 
 test('selected decision is consumed once, shown live, then restored to default', async () => {
   const choice = { decision_id: 'choice-one', cycle_number: 1, result: 'SELECT_ASSET' as const,
+    decided_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + 60000).toISOString(),
     asset: { id: 7, name: 'Selected', s3_uri: 's3://media/selected.mp4' } };
   const { service, repo, calls, advance, logs } = fixture([choice]);
@@ -112,8 +113,15 @@ test('selected decision is consumed once, shown live, then restored to default',
     'ivs_takeover_confirmation', 'asset_transition']) {
     assert.ok(logs.some((entry) => entry.stage === stage && entry.outcome === 'completed' && entry.demoId === started.id), stage);
   }
-  assert.ok(logs.some((entry) => entry.event === 'demo_source_switched' && entry.assetType === 'default' && entry.fromAssetId === 7));
+  assert.ok(logs.some((entry) => entry.event === 'demo_source_switched' && entry.assetType === 'default'
+    && entry.fromAssetId === 7 && typeof entry.sourceVersion === 'number'));
   assert.ok(logs.some((entry) => entry.event === 'demo_decision_handled' && entry.outcome === 'switched' && entry.decisionId === 'choice-one'));
+  assert.ok(logs.some((entry) => entry.event === 'demo_decision_received' && entry.decisionId === 'choice-one'
+    && entry.decidedAt === choice.decided_at && typeof entry.pollRequestMs === 'number'
+    && typeof entry.configuredPollIntervalMs === 'number' && typeof entry.feedGeneratedAt === 'string'
+    && typeof entry.decisionToFeedMs === 'number'));
+  assert.ok(logs.some((entry) => entry.event === 'demo_ivs_takeover_probe' && entry.assetId === 7
+    && entry.result === 'confirmed' && typeof entry.requestDurationMs === 'number'));
   assert.ok(!JSON.stringify(logs).includes('Bearer token'));
   await service.stop(started.id, 'Bearer token');
   await until(() => repo.find(started.id)?.status === 'stopped');
@@ -276,7 +284,7 @@ test('slow media preparation cannot postpone expiry, and Stop discards prepared 
   await until(() => repo.find(demo.id)?.status === 'default_live');
   await service.stop(demo.id, 'token');
   const starts = calls.publisherStarts;
-  release({ path: 'prepared', hasAudio: true, durationSeconds: 120 });
+  release({ path: 'prepared', hasAudio: true, publishMode: 'encode', mediaProfile: null, durationSeconds: 120 });
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(calls.publisherStarts, starts);
 });
@@ -308,7 +316,7 @@ test('failed default restoration ends Demo instead of looping selected indefinit
 
 test('long assets are interrupted at the hold deadline; short assets do not restore early', async () => {
   const { service, repo, media, calls, advance } = fixture([choice(1, 7)]);
-  media.prepare = async (uri) => ({ path: uri, hasAudio: true, durationSeconds: 120 });
+  media.prepare = async (uri) => ({ path: uri, hasAudio: true, publishMode: 'encode', mediaProfile: null, durationSeconds: 120 });
   const demo = await service.start('capture-long', 1, 'long-key', 'token');
   await until(() => repo.find(demo.id)?.status === 'selected_live');
   assert.equal(repo.find(demo.id)?.selectedDurationSeconds, 120);
@@ -351,4 +359,19 @@ test('deadline interrupts an in-flight selected takeover before restoring defaul
   await until(() => repo.find(demo.id)?.status === 'default_live');
   assert.deepEqual(calls.content, ['default', 'selected', 'default']);
   await service.stop(demo.id, 'token');
+});
+
+test('a new prepared version of the same asset switches instead of renewing the old file', async () => {
+  const expires = new Date(Date.now() + 60000).toISOString();
+  const decisions: Decision[] = [{ decision_id: 'version-one', cycle_number: 1, result: 'SELECT_ASSET', expires_at: expires,
+    asset: { id: 1, name: 'same asset', s3_uri: 's3://media/one.mp4', media_profile: 'square800-v1' } }];
+  const { service, repo, calls } = fixture(decisions);
+  const session = await service.start('capture-versioned', 1, 'versioned', 'Bearer token');
+  try {
+    await until(() => repo.find(session.id)?.decisionId === 'version-one');
+    decisions.push({ ...decisions[0]!, decision_id: 'version-two', cycle_number: 2,
+      asset: { ...decisions[0]!.asset!, s3_uri: 's3://media/two.mp4' } });
+    await until(() => repo.find(session.id)?.decisionId === 'version-two');
+    assert.equal(calls.publisherStarts, 3);
+  } finally { await service.stop(session.id, 'Bearer token'); }
 });
