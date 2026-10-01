@@ -21,7 +21,10 @@ export function loadMediaWorkerConfig(): MediaWorkerConfig {
   };
   const laravelBaseUrl = required('LARAVEL_API_BASE_URL').replace(/\/+$/, '');
   const secret = required('DEMO_STREAM_SERVICE_SECRET');
-  if (new URL(laravelBaseUrl).protocol !== 'https:' || secret.length < 32) throw new Error('Invalid media worker API configuration');
+  const api = new URL(laravelBaseUrl);
+  const localHttp = api.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(api.hostname);
+  if ((api.protocol !== 'https:' && !localHttp) || api.username || api.password || api.search || api.hash
+    || secret.length < 32) throw new Error('Invalid media worker API configuration');
   const outputBucket = required('MEDIA_OUTPUT_BUCKET');
   const sourceBuckets = (process.env.MEDIA_SOURCE_BUCKETS ?? outputBucket).split(',').map(v => v.trim()).filter(Boolean);
   const pollIntervalMs = Number(process.env.MEDIA_POLL_INTERVAL_MS ?? 2000);

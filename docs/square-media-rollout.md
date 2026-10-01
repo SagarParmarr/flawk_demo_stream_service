@@ -96,3 +96,9 @@ journalctl -u flawk-demo.service -f -o cat
 Node logs include assetId, generation, attempt, UTC timestamps and monotonic durationMs. Spans use `demo_timing`; queue wait uses `adaptive_media_timing`, result/failure/cleanup events use `adaptive_media_*`. Laravel logs `adaptive_media_status`. Do not sum total with nested spans. Commands, S3 locations, stderr and credentials are excluded.
 
 Live publishing logs remain separate: `demo_media_ready`/`demo_publisher_start` show mode/profile. Copy uses `ffmpeg_first_published_progress`; encode uses `ffmpeg_first_encoded_frame`. Neither proves that a viewer displayed a frame. CMS preview proves the converted asset; deployed S3/IVS/native hardware and visible first-frame timing require separate observation.
+
+## Local CMS development
+
+Run the media worker separately from the Demo stream server. Copy `.env.media.example` to `.env.media` and set `LARAVEL_API_BASE_URL` to your local CMS API (for example `http://127.0.0.1:8000`), `DEMO_STREAM_SERVICE_SECRET` to the matching CMS secret, and `MEDIA_OUTPUT_BUCKET` to the CMS S3 disk bucket. Loopback HTTP is accepted for local development; remote APIs require HTTPS. Supply the worker AWS credentials through your normal local AWS configuration. Run `npm run media:dev`. This command loads `.env.media`; the stream server continues to use `.env`.
+
+A worker pointed at the hosted CMS cannot claim local database assets. Enabling `ADAPTIVE_MEDIA_NODE_ENABLED` without starting a matching worker leaves uploads pending with zero attempts. The CMS reports this waiting state and enables converted preview after activation.

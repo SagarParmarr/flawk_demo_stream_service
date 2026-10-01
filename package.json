@@ -9,7 +9,7 @@
     "dev": "node --env-file=.env --watch --import tsx src/server.ts",
     "start": "node --env-file=.env --watch --import tsx src/server.ts",
     "start:prod": "node --experimental-sqlite dist/src/server.js",
-    "media:dev": "node --env-file=.env --import tsx src/media-worker.ts",
+    "media:dev": "node --env-file=.env.media --import tsx src/media-worker.ts",
     "media:prod": "node dist/src/media-worker.js",
     "test": "node --experimental-sqlite --import tsx --test test/*.test.ts",
     "check": "tsc --noEmit -p tsconfig.json"
