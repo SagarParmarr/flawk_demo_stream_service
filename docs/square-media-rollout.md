@@ -40,8 +40,8 @@ Completion retries never re-encode. An ambiguous completion response never delet
 Same configured bucket, separate prefixes:
 
 ```text
-adaptive-assets/{asset-id}/original/{upload-uuid}.mp4
-adaptive-assets/{asset-id}/prepared/square800-v1/{generation}-{claim-token}.mp4
+flawk_cms/adaptive_assets/{asset-id}/original/{upload-uuid}.mp4
+flawk_cms/adaptive_assets/{asset-id}/prepared/square800-v1/{generation}-{claim-token}.mp4
 ```
 
 Keep originals for crop edits. Legacy originals retain their keys. Outputs have `media-profile=square800-v1` metadata and no public ACL; keep bucket public-access controls configured. The worker role needs GetObject on allowed originals/defaults, and GetObject/PutObject/DeleteObject on prepared outputs; multipart uploads may also need AbortMultipartUpload. Laravel keeps original upload and preview-signing access. Callback destinations and credentials come from managed configuration, never job payloads.
@@ -60,7 +60,7 @@ A new prepared URI for the same asset triggers a real switch; ordinary same-asse
 These are rollout instructions; local implementation does not apply production changes.
 
 1. Deploy Laravel's preparation and lease migrations, internal routes, crop/preview UI, and handoff code with `ADAPTIVE_MEDIA_NODE_ENABLED=false`. Rebuild its normal deployment caches. Keep the prior Laravel preparation queue/code for rollback. Drain PHP media work between Demos; stop/restart long-lived media workers before switching ownership so older running code cannot compete with Node.
-2. Install FFmpeg/FFprobe with libx264/AAC and AWS CLI on the media host. Build this repo using Node >=22.13: `npm ci`, `npm run check`, `npm test`, `npm run build`. The real conversion test honors `FFMPEG_PATH` and `FFPROBE_PATH`; export both when the capable binaries are outside `PATH`. `npm test` does not automatically load `.env` or the systemd environment file. A binary without the required encoders fails the test. Configure bounded S3 permissions.
+2. Install FFmpeg/FFprobe with libx264/AAC and AWS CLI on the media host. Build this repo using Node >=22.13: `npm ci`, `npm run check`, `npm test`, `npm run build`. `npm test` loads optional checkout `.env` and `.env.media` files; `.env.media` takes precedence over `.env`, while exported shell variables override both. Set absolute `FFMPEG_PATH` and `FFPROBE_PATH` in `.env.media` when the capable binaries are outside `PATH`. The test reports its selected binaries and fails clearly if configured binaries are unavailable or lack libx264/AAC. It does not load systemd's `/etc/flawk-demo/media.env`; keep the same binary paths in that file for the deployed worker. Configure bounded S3 permissions.
 3. Copy `.env.media.example` into `/etc/flawk-demo/media.env`. Set the CMS URL, matching secret, output bucket, source bucket allowlist and work directory. Install `deploy/flawk-media-worker.service` with the actual Node path/user/checkout. Start it; endpoint unavailability while the flag is off is expected. It needs no Go-Live/IVS credentials or publisher SQLite database.
 4. Enable Laravel `ADAPTIVE_MEDIA_NODE_ENABLED=true`, keep `ADAPTIVE_IVS_PLAYOUT_ENABLED=false`, rebuild config cache and restart long-lived PHP workers. The enabled flag guards legacy PHP probing/preparation/publishing. Already serialized preparation jobs leave durable rows for Node. Mobile must use `EXPO_PUBLIC_DEMO_STREAM_ENABLED=true`; existing cleanup jobs can still stop legacy sessions.
 5. Validate one upload/crop and converted signed preview. Inspect backfill with `php artisan adaptive:prepare-assets --all --include-default --dry-run`, then run the approved backfill without `--dry-run`. Pending/completed assets are skipped; `--retry-failed` includes failures. Raw defaults get inactive records and cannot enter LLM selection. Re-run after completion to print the prepared default URI.

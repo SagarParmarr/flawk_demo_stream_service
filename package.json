@@ -11,7 +11,7 @@
     "start:prod": "node --experimental-sqlite dist/src/server.js",
     "media:dev": "node --env-file=.env.media --import tsx src/media-worker.ts",
     "media:prod": "node dist/src/media-worker.js",
-    "test": "node --experimental-sqlite --import tsx --test test/*.test.ts",
+    "test": "node --env-file-if-exists=.env --env-file-if-exists=.env.media --experimental-sqlite --import tsx --test test/*.test.ts",
     "check": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

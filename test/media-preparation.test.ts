@@ -14,13 +14,13 @@ import { MediaPreparationClient } from '../src/integrations/laravel/media-prepar
 const job: MediaPreparationJob = {
   asset_id: 123, generation: '12345678-1234-4234-8234-123456789abc', token: '23456789-1234-4234-8234-123456789abc',
   attempt: 1, requested_at: new Date(Date.now() - 5000).toISOString(), source_s3_uri: 's3://allowed/original.mp4',
-  output_bucket: 'allowed', output_key: 'adaptive-assets/123/prepared/square800-v1/12345678-1234-4234-8234-123456789abc-23456789-1234-4234-8234-123456789abc.mp4',
+  output_bucket: 'allowed', output_key: 'flawk_cms/adaptive_assets/123/prepared/square800-v1/12345678-1234-4234-8234-123456789abc-23456789-1234-4234-8234-123456789abc.mp4',
   crop_x: 0.8, crop_y: 0.1, media_profile: 'square800-v1',
 };
 
 test('untrusted jobs cannot choose arbitrary S3 buckets or output paths', () => {
   assert.doesNotThrow(() => validatePreparationJob(job, 'allowed', ['allowed']));
-  for (const mutation of [{ output_bucket: 'other' }, { output_key: 'active/overwrite.mp4' }, { crop_x: NaN },
+  for (const mutation of [{ output_bucket: 'other' }, { output_key: 'active/overwrite.mp4' }, { output_key: job.output_key.replace('flawk_cms/adaptive_assets/', 'adaptive-assets/') }, { crop_x: NaN },
     { source_s3_uri: 's3://other/private.mp4' }, { token: '../file' }, { crop_y: -0.2 }]) {
     assert.throws(() => validatePreparationJob({ ...job, ...mutation }, 'allowed', ['allowed']));
   }

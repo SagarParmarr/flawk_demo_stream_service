@@ -21,7 +21,7 @@ The playback URL stays the Node channel's IVS `.m3u8` URL. `GET /demo-streams/{i
 - `src/integrations`: Laravel, Node, S3, and FFmpeg clients.
 - `src/infrastructure`: configuration and WAL-mode SQLite persistence.
 
-Run `npm ci`, `npm run check`, `npm test`, and `npm run build` with Node 22.13 or newer. For local development, load a noncommitted `.env` through your shell or process manager, then run `npm run dev`. `npm start` uses Node's SQLite flag for Node 22.
+Run `npm ci`, `npm run check`, `npm test`, and `npm run build` with Node 22.13 or newer. Tests load optional `.env` and `.env.media` files from the checkout, with `.env.media` taking precedence and exported shell variables overriding both. Set `FFMPEG_PATH` and `FFPROBE_PATH` there to the capable binaries used by the media worker. For local development, load a noncommitted `.env` through your shell or process manager, then run `npm run dev`. `npm start` uses Node's SQLite flag for Node 22.
 
 ## Required configuration
 

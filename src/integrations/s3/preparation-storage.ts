@@ -11,7 +11,7 @@ export function validatePreparationJob(job: MediaPreparationJob, outputBucket: s
   if (!Number.isSafeInteger(job.asset_id) || job.asset_id < 1 || !uuid.test(job.generation) || !uuid.test(job.token)
     || job.media_profile !== SQUARE_PROFILE || job.output_bucket !== outputBucket
     || !source || !sourceBuckets.includes(source[1]!) || job.source_s3_uri.includes('\0')
-    || job.output_key !== `adaptive-assets/${job.asset_id}/prepared/${SQUARE_PROFILE}/${job.generation}-${job.token}.mp4`
+    || job.output_key !== `flawk_cms/adaptive_assets/${job.asset_id}/prepared/${SQUARE_PROFILE}/${job.generation}-${job.token}.mp4`
     || ![job.crop_x, job.crop_y].every(v => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1)
     || !Number.isInteger(job.attempt) || job.attempt < 1 || job.attempt > 3
     || !Number.isFinite(Date.parse(job.requested_at))) throw new Error('Invalid media preparation job');

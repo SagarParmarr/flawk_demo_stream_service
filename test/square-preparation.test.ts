@@ -8,21 +8,31 @@ import path from "node:path";
 import { SquarePreparation } from "../src/integrations/ffmpeg/square-preparation.js";
 
 const execute = promisify(execFile);
+const ffmpeg = process.env.FFMPEG_PATH ?? "ffmpeg";
+const ffprobe = process.env.FFPROBE_PATH ?? "ffprobe";
 test("full-range originals convert to verified limited-range square video", async (t) => {
+  t.diagnostic(`Media binaries: FFmpeg=${ffmpeg}; FFprobe=${ffprobe}`);
   if (
-    spawnSync(process.env.FFMPEG_PATH ?? "ffmpeg", ["-version"]).status !== 0 ||
-    spawnSync(process.env.FFPROBE_PATH ?? "ffprobe", ["-version"]).status !== 0
+    spawnSync(ffmpeg, ["-version"], { timeout: 5000 }).status !== 0 ||
+    spawnSync(ffprobe, ["-version"], { timeout: 5000 }).status !== 0
   ) {
+    assert.ok(!process.env.FFMPEG_PATH && !process.env.FFPROBE_PATH,
+      "Configured FFMPEG_PATH and FFPROBE_PATH must point to runnable binaries");
     t.skip(
       "FFmpeg and FFprobe are required for the real conversion regression",
     );
     return;
   }
+  const { stdout: encoders } = await execute(ffmpeg, ["-hide_banner", "-encoders"], { timeout: 5000 });
+  for (const encoder of ["libx264", "aac"]) {
+    assert.ok(new RegExp(`\\b${encoder}\\b`).test(encoders),
+      `${ffmpeg} lacks ${encoder}; configure FFMPEG_PATH in .env.media to a build with libx264 and AAC support`);
+  }
   const directory = await mkdtemp(path.join(tmpdir(), "full-range-media-"));
   try {
     const input = path.join(directory, "source.mp4");
     const output = path.join(directory, "prepared.mp4");
-    await execute(process.env.FFMPEG_PATH ?? "ffmpeg", [
+    await execute(ffmpeg, [
       "-hide_banner",
       "-loglevel",
       "error",
@@ -44,8 +54,8 @@ test("full-range originals convert to verified limited-range square video", asyn
       input,
     ]);
     const encoder = new SquarePreparation(
-      process.env.FFMPEG_PATH ?? "ffmpeg",
-      process.env.FFPROBE_PATH ?? "ffprobe",
+      ffmpeg,
+      ffprobe,
     );
     const source = await encoder.probe(input);
     assert.equal(
