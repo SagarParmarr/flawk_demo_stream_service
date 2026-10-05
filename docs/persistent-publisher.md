@@ -42,7 +42,7 @@ The preparation worker selects the output from the claimed job's `media_profile`
 
 The upstream CMS must accept/produce this new profile value and preparation path before scheduling v2 jobs. This repository does not change the CMS or regenerate/upload existing production assets. The default must also be prepared as v2 before enabling the feature.
 
-V2 uses 800×800, square pixels, 30 FPS, H.264 Main level 3.2, one reference frame, no B-frames, IDR every 60 frames, closed GOPs and AAC-LC stereo 44.1 kHz. Preparation keeps the existing bitrate targets and adds zero-latency tuning. V2 uses VBR HRD signaling because MP4 does not support x264 CBR HRD; rate targets remain constrained. Legacy x264 arguments are unchanged.
+V2 uses 800×800, square pixels, 30 FPS, H.264 Main level 3.2, one reference frame, no B-frames, IDR every 60 frames, closed GOPs and AAC-LC stereo 44.1 kHz. Preparation normalizes the output matrix and color configuration to BT.709 so source color metadata cannot produce incompatible H.264 parameter sets. Preparation keeps the existing bitrate targets and adds zero-latency tuning. V2 uses VBR HRD signaling because MP4 does not support x264 CBR HRD; rate targets remain constrained. Legacy x264 arguments are unchanged.
 
 V2 pads the last picture and audio to the next complete two-second GOP. For example, a three-second source becomes a four-second prepared asset. No frames are re-encoded during Demo playback. The helper validates packet timestamps, actual IDR NAL units, reference count, audio origin, complete GOPs and codec configuration. Each selected asset must have identical H.264/AAC decoder configuration to the default. A marker or matching dimensions alone does not establish compatibility.
 

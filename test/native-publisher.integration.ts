@@ -30,7 +30,7 @@ test('persistent copy output: 100 switches, loops, rejection, cancellation and c
       const output = path.join(dir, `${color}.mp4`);
       await execute(ffmpeg, ['-v','error','-y','-f','lavfi','-i',`color=${color}:size=320x180:rate=30`,
         '-f','lavfi','-i',`sine=frequency=${color === 'red' ? 440 : 880}:sample_rate=44100`,
-        '-t','3','-c:v','libx264','-c:a','aac',input]);
+        '-t','3','-c:v','libx264',...(color === 'red' ? ['-colorspace','bt470bg'] : []),'-c:a','aac',input]);
       await encoder.convert(input,output,await encoder.probe(input),.5,.5,undefined,'square800-copy-v2');
       assert.equal(await encoder.verify(output,undefined,'square800-copy-v2'),4);
       assets.push(output);
