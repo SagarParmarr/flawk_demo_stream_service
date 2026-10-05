@@ -34,12 +34,12 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 function fixture(decisions: Decision[] = [],
-  failure?: 'node-create' | 'slow-create' | 'download' | 'takeover') {
+  failure?: 'node-create' | 'slow-create' | 'download' | 'takeover', persistentMode = false) {
   let offset = 0;
   const clock = () => Date.now() + offset;
   const advance = (ms: number) => { offset += ms; };
   const repo = new MemoryRepository();
-  const calls = { created: 0, stoppedNode: 0, stoppedLaravel: 0, publisherStarts: 0, content: [] as string[] };
+  const calls = { created: 0, stoppedNode: 0, stoppedLaravel: 0, publisherStarts: 0, persistentStarts: 0, switches: [] as string[], versions: [] as number[], content: [] as string[] };
   let publisherStarts = 0;
   const laravel = {
     validate: async (id: string) => ({ session_id: id, owner_id: 4, unit_ids: [1], state: 'READY_FOR_CAPTURE' }),
@@ -60,24 +60,35 @@ function fixture(decisions: Decision[] = [],
       ({ name: failure === 'takeover' && index > 0 ? 'Stream Takeover Failure' : 'Stream Takeover',
         code: null, event_time: '2026-09-25T10:00:00Z' })) }),
     heartbeat: async () => undefined,
-    content: async (_id: string, _owner: number, type: string) => { calls.content.push(type); },
+    content: async (_id: string, _owner: number, type: string, _asset: number | null, version: number) => { calls.content.push(type); calls.versions.push(version); },
     stop: async () => { calls.stoppedNode++; },
   } as GoLivePort;
-  const config = { defaultS3Uri: 's3://media/default.mp4', pollIntervalMs: 500,
+  const config = { persistentPublisherEnabled: persistentMode, defaultS3Uri: 's3://media/default.mp4', pollIntervalMs: 500,
     heartbeatIntervalMs: 5000, maxDemoDurationMs: 600000, selectedAssetHoldSeconds: 30 } as Config;
   const media = { prepare: async (uri: string) => {
     if (failure === 'download' && !uri.includes('default')) throw new Error('S3 unavailable');
-    return { path: uri, hasAudio: true, publishMode: 'encode', mediaProfile: null, durationSeconds: uri.includes('default') ? 10 : 0.1 };
+    return { path: uri, hasAudio: true, publishMode: persistentMode ? 'copy' : 'encode', mediaProfile: persistentMode ? 'square800-copy-v2' : null, durationSeconds: uri.includes('default') ? 10 : 0.1 };
   } } as MediaPort;
   const ffmpeg = { start: async (_path: string, _audio: boolean, duration: number) => {
     publisherStarts++;
     calls.publisherStarts++;
     return new FakePublisher(duration);
   } } as PublisherPort;
+  const persistent = { start: async (_path: string, _audio: boolean, duration: number) => {
+    calls.persistentStarts++;
+    publisherStarts++;
+    return Object.assign(new FakePublisher(duration), {
+      switchSource: async (asset: { path: string }, _requestId: string, signal: AbortSignal) => {
+        if (signal.aborted) throw new Error('cancelled');
+        calls.switches.push(asset.path);
+        return { committedAt: new Date().toISOString(), outputTimestamp: calls.switches.length * 2 };
+      },
+    });
+  } } as PublisherPort;
   const logs: Record<string, unknown>[] = [];
   const record = (entry: Record<string, unknown>) => { logs.push(entry); };
   const log = { info: record, debug: record, warn: record, error: record } as unknown as FastifyBaseLogger;
-  return { service: new DemoService(config, repo, laravel, node, media, ffmpeg, log, clock), repo, calls, advance, laravel, media, node, logs };
+  return { service: new DemoService(config, repo, laravel, node, media, ffmpeg, log, clock, persistent), repo, calls, advance, laravel, media, node, logs, config, ffmpeg, persistent, log, clock };
 }
 
 test('Start is idempotent and Stop ends both downstream sessions', async () => {
@@ -374,4 +385,161 @@ test('a new prepared version of the same asset switches instead of renewing the 
     await until(() => repo.find(session.id)?.decisionId === 'version-two');
     assert.equal(calls.publisherStarts, 3);
   } finally { await service.stop(session.id, 'Bearer token'); }
+});
+
+
+test('persistent flag switches sources within one publisher and does not consume takeover capacity', async () => {
+  const choices: Decision[] = [];
+  const f = fixture(choices, undefined, true);
+  const started = await f.service.start('persistent', 1, 'persistent-key', 'Bearer token');
+  try {
+    await until(() => f.repo.find(started.id)?.status === 'default_live');
+    assert.equal(f.repo.find(started.id)?.publisherMode, 'persistent-copy');
+    const row = f.repo.find(started.id)!;
+    row.takeoverCount = 89; f.repo.save(row);
+    choices.push({ decision_id: 'select-a', cycle_number: 1, result: 'SELECT_ASSET', expires_at: null,
+      asset: { id: 1, name: 'A', s3_uri: 's3://media/a.mp4' } });
+    await until(() => f.repo.find(started.id)?.assetId === 1);
+    assert.equal(f.calls.persistentStarts, 1);
+    assert.equal(f.calls.publisherStarts, 0);
+    assert.equal(f.repo.find(started.id)?.takeoverCount, 89);
+    assert.equal(f.repo.find(started.id)?.sourceVersion, 2);
+    choices.push({ ...choices[0]!, decision_id: 'renew-a', cycle_number: 2 });
+    await until(() => f.repo.find(started.id)?.decisionId === 'renew-a');
+    assert.equal(f.calls.switches.length, 1);
+    choices.push({ ...choices[0]!, decision_id: 'select-b', cycle_number: 3,
+      asset: { id: 2, name: 'B', s3_uri: 's3://media/b.mp4' } });
+    await until(() => f.repo.find(started.id)?.assetId === 2);
+    f.advance(31000);
+    await until(() => f.calls.switches.length === 3 && f.repo.find(started.id)?.status === 'default_live');
+    assert.equal(f.calls.persistentStarts, 1);
+    assert.deepEqual(f.calls.versions, [1,2,3,4]);
+    assert.equal(f.repo.find(started.id)?.priority, 0);
+  } finally { await f.service.stop(started.id, 'Bearer token'); await until(() => f.repo.find(started.id)?.status === 'stopped'); }
+});
+
+test('incompatible persistent selection retains the current source', async () => {
+  const choices: Decision[] = [];
+  const f = fixture(choices, undefined, true);
+  const started = await f.service.start('persistent-reject', 1, 'persistent-reject-key', 'Bearer token');
+  try {
+    await until(() => f.repo.find(started.id)?.status === 'default_live');
+    f.media.prepare = async () => ({path:'wrong',hasAudio:true,durationSeconds:2,publishMode:'copy',mediaProfile:'square800-v1'});
+    choices.push({decision_id:'bad',cycle_number:1,result:'SELECT_ASSET',expires_at:null,
+      asset:{id:1,name:'wrong',s3_uri:'s3://media/bad.mp4'}});
+    await until(() => f.repo.find(started.id)?.decisionCursor === 1 && f.logs.some(l => l.error));
+    assert.equal(f.repo.find(started.id)?.status,'default_live');
+    assert.equal(f.calls.switches.length,0);
+    assert.equal(f.calls.publisherStarts,0);
+  } finally { await f.service.stop(started.id,'Bearer token'); await until(() => f.repo.find(started.id)?.status === 'stopped'); }
+});
+
+test('recovery uses the saved persistent mode even when the ENV flag is disabled', async () => {
+  const f = fixture([], undefined, true);
+  const started = await f.service.start('persistent-recovery',1,'persistent-recovery-key','Bearer token');
+  await until(() => f.repo.find(started.id)?.status === 'default_live');
+  await f.service.shutdown();
+  f.config.persistentPublisherEnabled = false;
+  f.config.persistentDefaultS3Uri = 's3://media/changed-default.mp4';
+  const prepared: string[]=[];
+  const oldPrepare=f.media.prepare;
+  f.media.prepare=async (...args)=>{prepared.push(args[0]);return oldPrepare(...args);};
+  const recovered = new DemoService(f.config,f.repo,f.laravel,f.node,f.media,f.ffmpeg,f.log,f.clock,f.persistent);
+  try {
+    await recovered.recover();
+    await until(() => f.calls.persistentStarts === 2 && f.repo.find(started.id)?.operation === null);
+    assert.equal(f.repo.find(started.id)?.publisherMode,'persistent-copy');
+    assert.equal(f.repo.find(started.id)?.sourceVersion,2);
+    assert.deepEqual(prepared,['s3://media/default.mp4']);
+    assert.equal(f.calls.publisherStarts,0);
+  } finally { await recovered.stop(started.id,'Bearer token'); await until(() => f.repo.find(started.id)?.status === 'stopped'); }
+});
+
+test('legacy recovery ignores an enabled persistent flag', async () => {
+  const f = fixture();
+  const started = await f.service.start('legacy-recovery',1,'legacy-recovery-key','Bearer token');
+  await until(() => f.repo.find(started.id)?.status === 'default_live');
+  await f.service.shutdown();
+  f.config.persistentPublisherEnabled = true;
+  const recovered = new DemoService(f.config,f.repo,f.laravel,f.node,f.media,f.ffmpeg,f.log,f.clock,f.persistent);
+  try {
+    await recovered.recover();
+    await until(() => f.calls.publisherStarts === 2 && f.repo.find(started.id)?.operation === null);
+    assert.equal(f.repo.find(started.id)?.publisherMode,'legacy');
+    assert.equal(f.calls.persistentStarts,0);
+  } finally { await recovered.stop(started.id,'Bearer token'); await until(() => f.repo.find(started.id)?.status === 'stopped'); }
+});
+
+
+test('persistent expiry restores default after a cancellation races a committed selection', async () => {
+  const choices: Decision[]=[];
+  const f=fixture(choices,undefined,true);
+  let waiting: AbortSignal | undefined;
+  let resolveRace: (()=>void) | undefined;
+  const factoryStart=f.persistent.start;
+  f.persistent.start=async (...args) => {
+    const publisher=await factoryStart(...args);
+    const original=publisher.switchSource!;
+    publisher.switchSource=async (media,id,signal) => {
+      if (media.path.includes('b.mp4')) {
+        waiting=signal;
+        await new Promise<void>(resolve=>{resolveRace=resolve;});
+        f.calls.switches.push(media.path);
+        return {committedAt:new Date().toISOString(),outputTimestamp:4};
+      }
+      return original(media,id,signal);
+    };
+    return publisher;
+  };
+  const started=await f.service.start('race',1,'race-key','Bearer token');
+  try {
+    await until(()=>f.repo.find(started.id)?.status==='default_live');
+    choices.push({decision_id:'a',cycle_number:1,result:'SELECT_ASSET',expires_at:null,
+      asset:{id:1,name:'A',s3_uri:'s3://media/a.mp4'}});
+    await until(()=>f.repo.find(started.id)?.assetId===1);
+    choices.push({...choices[0]!,decision_id:'b',cycle_number:2,asset:{id:2,name:'B',s3_uri:'s3://media/b.mp4'}});
+    await until(()=>Boolean(waiting));
+    f.advance(31000);
+    await until(()=>waiting!.aborted);
+    resolveRace!();
+    await until(()=>f.repo.find(started.id)?.status==='default_live' && f.calls.switches.length===3);
+    assert.equal(f.repo.find(started.id)?.sourceVersion,4);
+    assert.deepEqual(f.calls.content,['default','selected','selected','default']);
+  } finally {resolveRace?.();await f.service.stop(started.id,'Bearer token');await until(()=>f.repo.find(started.id)?.status==='stopped');}
+});
+
+test('persistent publisher death cleans up even while decision polling is hung', async () => {
+  const f=fixture([],undefined,true);
+  let die!: ()=>void;
+  f.persistent.start=async (_p,_a,duration)=>{
+    let running=true;
+    let resolve!: (code:number|null)=>void;
+    const exit=new Promise<number|null>(r=>{resolve=r;});
+    die=()=>{running=false;resolve(1);};
+    return {pid:555,startedAt:new Date().toISOString(),durationSeconds:duration,
+      exit,alive:()=>running,stop:async()=>{running=false;resolve(0);}};
+  };
+  f.laravel.decisions=async()=>new Promise(()=>undefined);
+  const started=await f.service.start('death',1,'death-key','Bearer token');
+  await until(()=>f.repo.find(started.id)?.status==='default_live');
+  die();
+  await until(()=>f.repo.find(started.id)?.status==='failed');
+  assert.equal(f.calls.stoppedNode,1);
+  assert.equal(f.calls.stoppedLaravel,1);
+});
+
+
+test('flag-off legacy selections do not admit the new preparation profile', async () => {
+  const choices: Decision[]=[];
+  const f=fixture(choices);
+  const started=await f.service.start('legacy-v2',1,'legacy-v2-key','Bearer token');
+  try {
+    await until(()=>f.repo.find(started.id)?.status==='default_live');
+    choices.push({decision_id:'v2',cycle_number:1,result:'SELECT_ASSET',expires_at:null,
+      asset:{id:1,name:'v2',s3_uri:'s3://media/v2.mp4',media_profile:'square800-copy-v2'}});
+    await until(()=>f.repo.find(started.id)?.decisionCursor===1 && f.logs.some(l=>l.error));
+    assert.equal(f.calls.publisherStarts,1);
+    assert.equal(f.calls.persistentStarts,0);
+    assert.equal(f.repo.find(started.id)?.status,'default_live');
+  } finally {await f.service.stop(started.id,'Bearer token');await until(()=>f.repo.find(started.id)?.status==='stopped');}
 });

@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import type { FastifyBaseLogger } from 'fastify';
-import { SQUARE_PROFILE, type MediaPreparationJob, type MediaPreparationQueue } from '../domain/media-preparation.js';
+import { type MediaPreparationJob, type MediaPreparationQueue } from '../domain/media-preparation.js';
 import type { MediaWorkerConfig } from '../infrastructure/media-config.js';
 import type { SquarePreparation } from '../integrations/ffmpeg/square-preparation.js';
 import { validatePreparationJob, type PreparationStorage } from '../integrations/s3/preparation-storage.js';
@@ -35,8 +35,8 @@ export class MediaPreparationWorker {
         await timed(this.log, 'preparation_s3_download', context, () => this.storage.download(job, input, signal));
         const probe = await timed(this.log, 'preparation_input_probe', context, () => this.encoder.probe(input, signal));
         await timed(this.log, 'preparation_ffmpeg_conversion', context,
-          () => this.encoder.convert(input, output, probe, job.crop_x, job.crop_y, signal));
-        const duration = await timed(this.log, 'preparation_output_verify', context, () => this.encoder.verify(output, signal));
+          () => this.encoder.convert(input, output, probe, job.crop_x, job.crop_y, signal, job.media_profile));
+        const duration = await timed(this.log, 'preparation_output_verify', context, () => this.encoder.verify(output, signal, job.media_profile));
         if (!await timed(this.log, 'preparation_lease_check', context, () => this.queue.current(job))) {
           this.log.info({ ...context, event: 'adaptive_media_superseded' }, 'Obsolete conversion skipped');
           return;
@@ -46,7 +46,7 @@ export class MediaPreparationWorker {
         callbackAttempted = true;
         const accepted = await timed(this.log, 'preparation_laravel_activation', context, () => this.complete(job, duration));
         if (!accepted) await this.discard(job);
-        this.log.info({ ...context, event: 'adaptive_media_result', outcome: accepted ? 'ready' : 'superseded', mediaProfile: SQUARE_PROFILE }, 'Media preparation result');
+        this.log.info({ ...context, event: 'adaptive_media_result', outcome: accepted ? 'ready' : 'superseded', mediaProfile: job.media_profile }, 'Media preparation result');
       });
     } catch (error) {
       this.log.warn({ ...context, event: 'adaptive_media_failed', errorName: error instanceof Error ? error.name : 'UnknownError' }, 'Media preparation will retry or fail');
@@ -63,7 +63,7 @@ export class MediaPreparationWorker {
   private async complete(job: MediaPreparationJob, duration: number): Promise<boolean> {
     // Completion is idempotent. Retry the callback rather than encoding again after a lost response.
     for (let attempt = 0; ; attempt++) {
-      try { return await this.queue.complete(job, { output_key: job.output_key, media_profile: SQUARE_PROFILE,
+      try { return await this.queue.complete(job, { output_key: job.output_key, media_profile: job.media_profile,
         width: 800, height: 800, duration_seconds: duration }); }
       catch (error) { if (attempt >= 2) throw error; }
     }

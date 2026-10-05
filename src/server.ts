@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import Fastify from 'fastify';
 import { registerRoutes } from './api/routes.js';
 import { DemoService } from './application/demo-service.js';
+import { PersistentFactory, checkPersistentBinary } from './integrations/ffmpeg/persistent.js';
 import { FfmpegFactory } from './integrations/ffmpeg/process.js';
 import { GoLiveClient } from './integrations/go-live/client.js';
 import { LaravelClient } from './integrations/laravel/client.js';
@@ -18,12 +19,16 @@ const repository = new SqliteDemoRepository(config.databasePath);
 const service = new DemoService(config, repository,
   new LaravelClient(config.laravelBaseUrl, config.laravelSecret),
   new GoLiveClient(config.nodeBaseUrl, config.nodeSecret),
-  new MediaCache(config.cacheDirectory, config.awsPath, config.ffprobePath, app.log),
-  new FfmpegFactory(config.ffmpegPath, app.log, config.ingestKeyframeInterval), app.log);
+  new MediaCache(config.cacheDirectory, config.awsPath, config.ffprobePath, app.log, config.persistentPublisherPath),
+  new FfmpegFactory(config.ffmpegPath, app.log, config.ingestKeyframeInterval), app.log, Date.now,
+  new PersistentFactory(config.persistentPublisherPath!, app.log, config.ingestKeyframeInterval));
 let ready = false;
 registerRoutes(app, service, () => ready);
 
 try {
+  if (config.persistentPublisherEnabled || repository.listNonterminal().some(s => s.publisherMode === 'persistent-copy')) {
+    checkPersistentBinary(config.persistentPublisherPath!);
+  }
   for (const binary of [config.ffmpegPath, config.ffprobePath, config.awsPath]) {
     if (binary.includes('/')) await access(binary, constants.X_OK);
     const checked = spawnSync(binary, [binary === config.awsPath ? '--version' : '-version'], { timeout: 5000, stdio: 'ignore' });

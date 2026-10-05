@@ -45,6 +45,7 @@ export class DemoService {
     private readonly ffmpeg: PublisherPort,
     private readonly log: FastifyBaseLogger,
     private readonly now: () => number = Date.now,
+    private readonly persistent?: PublisherPort,
   ) {}
 
   async start(adaptiveSessionId: string, unitId: number, key: string, bearer: string, mobilePresenceRequired = false): Promise<DemoSession> {
@@ -76,6 +77,8 @@ export class DemoService {
       adaptiveSessionId, goLiveSessionId: null, playbackUrl: null,
       idempotencyKey: key, status: 'starting', operation: 'starting_publisher',
       assetType: 'default', assetId: null, decisionId: null, decisionCursor: 0,
+      publisherMode: this.config.persistentPublisherEnabled ? 'persistent-copy' : 'legacy', sourceVersion: 1,
+      ...(this.config.persistentPublisherEnabled ? { persistentDefaultS3Uri: this.config.persistentDefaultS3Uri ?? this.config.defaultS3Uri } : {}),
       priority: 0, takeoverCount: 0, selectedStartedAt: null, selectedDurationSeconds: null,
       selectedExpiresAt: null, presenceExpiresAt: mobilePresenceRequired ? new Date(now + 60_000).toISOString() : null,
       nodeStopped: false, laravelStopped: false,
@@ -184,11 +187,12 @@ export class DemoService {
       cancelHeartbeat = this.keepSessionAlive(session.goLiveSessionId, session.ownerId);
       await timed(this.log, 'laravel_session_bind', this.context(id), () => this.laravel.bind(session.adaptiveSessionId, session.id, session.goLiveSessionId!, session.ownerId, session.unitId));
       const acquired = await timed(this.log, 'go_live_publisher_acquire', this.context(id), () => this.node.acquire(session.goLiveSessionId!, session.ownerId, session.unitId));
-      const defaultMedia = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.config.defaultS3Uri, 'default', { ...this.context(id), assetType: 'default' }));
+      const defaultMedia = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.defaultSource(session), 'default', { ...this.context(id), assetType: 'default' }, session.publisherMode === 'persistent-copy' ? 'square800-copy-v2' : undefined));
       if (this.shuttingDown || this.mustFind(id).status !== 'starting') return false;
-      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(defaultMedia.path, defaultMedia.hasAudio, defaultMedia.durationSeconds, acquired.ingest, 0, { ...this.context(id), assetType: 'default' }, defaultMedia.publishMode));
+      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.publisherFactory(session, defaultMedia).start(defaultMedia.path, defaultMedia.hasAudio, defaultMedia.durationSeconds, acquired.ingest, 0, { ...this.context(id), assetType: 'default' }, defaultMedia.publishMode));
       if (this.shuttingDown) { await publisher.stop(); return false; }
       this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), lastDecisionPollCompletedAt: null, defaultMedia, selectedSourceUri: null, switchAbort: null, switchTask: null, restoreTask: null });
+      if (session.publisherMode === 'persistent-copy') this.watchPublisherExit(id, publisher);
       if (this.mustFind(id).status !== 'starting') { await publisher.stop(); this.runtimes.delete(id); return false; }
       if (this.shuttingDown) return false;
       await timed(this.log, 'ivs_initial_live_confirmation', this.context(id), () => this.node.start(session.goLiveSessionId!, session.ownerId));
@@ -242,13 +246,14 @@ export class DemoService {
         throw new Error('Capture session no longer matches Demo');
       }
       const acquired = await timed(this.log, 'go_live_publisher_acquire', this.context(id), () => this.node.acquire(session.goLiveSessionId!, session.ownerId, session.unitId));
-      const source = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.config.defaultS3Uri, 'default', { ...this.context(id), assetType: 'default' }));
+      const source = await timed(this.log, 'default_media_prepare', this.context(id), () => this.media.prepare(this.defaultSource(session), 'default', { ...this.context(id), assetType: 'default' }, session.publisherMode === 'persistent-copy' ? 'square800-copy-v2' : undefined));
       if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) return false;
       const priority = session.priority + 1;
       const baseline = await timed(this.log, 'ivs_status_baseline', this.context(id), () => this.node.status(session.goLiveSessionId!, session.ownerId));
-      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.ffmpeg.start(source.path, source.hasAudio, source.durationSeconds, acquired.ingest, priority, { ...this.context(id), assetType: 'default' }, source.publishMode));
+      const publisher = await timed(this.log, 'ffmpeg_spawn', { ...this.context(id), assetType: 'default' }, () => this.publisherFactory(session, source).start(source.path, source.hasAudio, source.durationSeconds, acquired.ingest, priority, { ...this.context(id), assetType: 'default' }, source.publishMode));
       if (this.shuttingDown || !['starting', 'default_live', 'selected_live'].includes(this.mustFind(id).status)) { await publisher.stop(); return false; }
       this.runtimes.set(id, { publisher, pendingPublisher: null, ingest: acquired.ingest, busy: false, lastHeartbeat: this.now(), lastDecisionPollCompletedAt: null, defaultMedia: source, selectedSourceUri: null, switchAbort: null, switchTask: null, restoreTask: null });
+      if (session.publisherMode === 'persistent-copy') this.watchPublisherExit(id, publisher);
       if (this.shuttingDown) return false;
       if (baseline.is_live) {
         await timed(this.log, 'ivs_takeover_confirmation', this.context(id), () => waitForTakeover(publisher,
@@ -262,6 +267,7 @@ export class DemoService {
       if (!['starting', 'default_live', 'selected_live'].includes(session.status)) { await publisher.stop(); return false; }
       session.priority = priority;
       session.takeoverCount += 1;
+      session.sourceVersion = (session.sourceVersion ?? session.takeoverCount) + 1;
       session.assetType = 'default';
       session.assetId = null;
       session.decisionId = null;
@@ -364,7 +370,7 @@ export class DemoService {
   private validDecision(decision: Decision, session: DemoSession): boolean {
     if (decision.result !== 'SELECT_ASSET' || !decision.asset) return false;
     if (decision.decision_id === session.decisionId) return false;
-    if ((decision.asset.id !== session.assetId || this.runtimes.get(session.id)?.selectedSourceUri !== decision.asset.s3_uri) && !hasSelectedCapacity(session.takeoverCount)) return false;
+    if (session.publisherMode !== 'persistent-copy' && (decision.asset.id !== session.assetId || this.runtimes.get(session.id)?.selectedSourceUri !== decision.asset.s3_uri) && !hasSelectedCapacity(session.takeoverCount)) return false;
     if (decision.expires_at && (!Number.isFinite(Date.parse(decision.expires_at)) || Date.parse(decision.expires_at) <= this.now())) return false;
     return /^s3:\/\/[^/]+\/.+\.mp4$/i.test(decision.asset.s3_uri);
   }
@@ -386,7 +392,7 @@ export class DemoService {
     this.log.info?.({ ...this.context(id, decision), event: 'demo_decision_handled', startedAt,
       endedAt: new Date().toISOString(), durationMs: Math.round((performance.now() - start) * 100) / 100,
       outcome: after.status === 'selected_live' && after.decisionId === decision.decision_id
-        ? (after.takeoverCount > before.takeoverCount ? 'switched' : 'renewed') : 'skipped' }, 'Demo decision handling result');
+        ? ((after.sourceVersion ?? after.takeoverCount) > (before.sourceVersion ?? before.takeoverCount) ? 'switched' : 'renewed') : 'skipped' }, 'Demo decision handling result');
   }
 
   private async switchSelectedWork(id: string, decision: Decision): Promise<void> {
@@ -396,8 +402,11 @@ export class DemoService {
       this.renewSelection(session, decision.decision_id);
       return;
     }
+    if (session.publisherMode !== 'persistent-copy' && decision.asset.media_profile === 'square800-copy-v2') {
+      throw new Error('Copy-v2 assets require persistent mode');
+    }
     // Preparation must not hold the publisher lock or block deadline restoration.
-    const media = await timed(this.log, 'selected_media_prepare', this.context(id, decision), () => this.media.prepare(decision.asset!.s3_uri, decision.decision_id, this.context(id, decision), decision.asset!.media_profile));
+    const media = await timed(this.log, 'selected_media_prepare', this.context(id, decision), () => this.media.prepare(decision.asset!.s3_uri, decision.decision_id, this.context(id, decision), session.publisherMode === 'persistent-copy' ? 'square800-copy-v2' : decision.asset!.media_profile));
     const runtime = this.runtimes.get(id);
     if (!runtime) return;
     await timed(this.log, 'publisher_lock_wait', this.context(id, decision), async () => {
@@ -436,7 +445,8 @@ export class DemoService {
         const restore = (async () => {
           await previous?.catch(() => undefined);
           const current = this.mustFind(id);
-          if (current.status !== 'selected_live' || current.decisionId !== session.decisionId || current.selectedExpiresAt !== session.selectedExpiresAt) return;
+          if (current.status !== 'selected_live') return;
+          if (current.publisherMode !== 'persistent-copy' && (current.decisionId !== session.decisionId || current.selectedExpiresAt !== session.selectedExpiresAt)) return;
           this.log.info?.({ demoId: id, decisionId: current.decisionId }, 'Demo selected playback expired');
           await this.switchPublisher(id, runtime.defaultMedia, 'default', null, null);
         })().catch(async (error) => {
@@ -465,7 +475,9 @@ export class DemoService {
     runtime.switchAbort = controller;
     session.operation = type === 'default' ? 'restoring_default' : 'switching_selected';
     this.repository.save(session);
-    const task = timed(this.log, 'asset_transition', { ...this.context(id), assetType: type, assetId, decisionId }, () => this.takeover(id, media, type, assetId, decisionId, controller.signal));
+    const task = timed(this.log, 'asset_transition', { ...this.context(id), assetType: type, assetId, decisionId }, () => session.publisherMode === 'persistent-copy'
+      ? this.switchPersistent(id, media, type, assetId, decisionId, controller.signal)
+      : this.takeover(id, media, type, assetId, decisionId, controller.signal));
     runtime.switchTask = task;
     try { await task; }
     finally {
@@ -475,6 +487,65 @@ export class DemoService {
         current.operation = null; this.repository.save(current);
       }
     }
+  }
+
+  private defaultSource(session: DemoSession): string {
+    return session.publisherMode === 'persistent-copy'
+      ? session.persistentDefaultS3Uri ?? this.config.persistentDefaultS3Uri ?? this.config.defaultS3Uri
+      : this.config.defaultS3Uri;
+  }
+
+  private watchPublisherExit(id: string, publisher: Publisher): void {
+    void publisher.exit.then(async () => {
+      if (this.shuttingDown || publisher.alive() || this.runtimes.get(id)?.publisher !== publisher) return;
+      const session = this.repository.find(id);
+      if (session && !isTerminal(session.status) && session.status !== 'stopping') {
+        session.error = 'Persistent publisher exited';
+        this.repository.save(session);
+        await this.stopInternal(id, true, 'persistent_publisher_exit');
+      }
+    }).catch(error => this.log.error({ demoId: id, error: safeError(error) }, 'Publisher cleanup failed'));
+  }
+
+  private publisherFactory(session: DemoSession, media: PreparedMedia): PublisherPort {
+    if (session.publisherMode !== 'persistent-copy') return this.ffmpeg;
+    this.requirePersistentMedia(media);
+    if (!this.persistent) throw new Error('Persistent publisher is unavailable');
+    return this.persistent;
+  }
+
+  private requirePersistentMedia(media: PreparedMedia): void {
+    if (media.mediaProfile !== 'square800-copy-v2' || media.publishMode !== 'copy' || !media.hasAudio) {
+      throw new Error('Persistent publisher requires square800-copy-v2');
+    }
+  }
+
+  private async switchPersistent(id: string, media: PreparedMedia,
+    type: 'default' | 'selected', assetId: number | null, decisionId: string | null, signal: AbortSignal): Promise<void> {
+    const runtime = this.runtimes.get(id);
+    if (!runtime?.publisher.switchSource) throw new Error('Persistent publisher is unavailable');
+    this.requirePersistentMedia(media);
+    const context = { ...this.context(id), assetType: type, assetId, decisionId };
+    const receipt = await timed(this.log, 'persistent_switch_commit', context,
+      () => runtime.publisher.switchSource!(media, randomUUID(), signal));
+    // Cancellation can race the output write. A committed receipt must be reconciled even
+    // when restoration has requested cancellation; restoration runs after this task.
+    const latest = this.mustFind(id);
+    if (this.shuttingDown || !['default_live', 'selected_live'].includes(latest.status)) return;
+    const previousAssetId = latest.assetId;
+    latest.sourceVersion = (latest.sourceVersion ?? latest.takeoverCount + 1) + 1;
+    latest.assetType = type;
+    latest.assetId = assetId;
+    latest.decisionId = decisionId;
+    latest.selectedStartedAt = type === 'selected' ? new Date(this.now()).toISOString() : null;
+    latest.selectedDurationSeconds = type === 'selected' ? media.durationSeconds : null;
+    latest.selectedExpiresAt = type === 'selected' ? new Date(this.now() + this.config.selectedAssetHoldSeconds * 1000).toISOString() : null;
+    if (type === 'default') runtime.selectedSourceUri = null;
+    this.repository.save(transition(latest, type === 'selected' ? 'selected_live' : 'default_live'));
+    this.log.info({ ...context, event: 'demo_source_switched', sourceVersion: latest.sourceVersion,
+      fromAssetId: previousAssetId, outputTimestamp: receipt.outputTimestamp,
+      confirmedAt: receipt.committedAt, confirmation: 'output_write' }, 'Persistent source committed');
+    await this.reportContent(latest);
   }
 
   private async takeover(id: string, media: PreparedMedia,
@@ -502,6 +573,7 @@ export class DemoService {
       runtime.publisher = replacement;
       latest.priority += 1;
       latest.takeoverCount += 1;
+      latest.sourceVersion = latest.takeoverCount + 1;
       latest.assetType = type;
       if (type === 'default') runtime.selectedSourceUri = null;
       latest.assetId = assetId;
@@ -523,7 +595,7 @@ export class DemoService {
 
   private async reportContent(session: DemoSession): Promise<void> {
     if (!session.goLiveSessionId) return;
-    try { await timed(this.log, 'go_live_content_report', this.context(session.id), () => this.node.content(session.goLiveSessionId!, session.ownerId, session.assetType, session.assetId, session.takeoverCount + 1)); }
+    try { await timed(this.log, 'go_live_content_report', this.context(session.id), () => this.node.content(session.goLiveSessionId!, session.ownerId, session.assetType, session.assetId, session.publisherMode === 'persistent-copy' ? session.sourceVersion ?? 1 : session.takeoverCount + 1)); }
     catch (error) { this.log.warn({ demoId: session.id, error: safeError(error) }, 'Node content update failed'); }
   }
 

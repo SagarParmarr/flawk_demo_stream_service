@@ -48,3 +48,21 @@ test('legacy JSON payloads normalize deadlines without a schema migration', () =
     assert.equal(repository.listNonterminal()[0]?.presenceExpiresAt, null);
   } finally { repository.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('legacy payload migration persists mode and content version across reopen', () => {
+  const directory=mkdtempSync(path.join(tmpdir(),'demo-mode-'));
+  const filename=path.join(directory,'demo.sqlite');
+  try {
+    const first=new SqliteDemoRepository(filename);
+    const old=demo('old',4,'default_live'); old.takeoverCount=5;
+    first.create(old); first.close();
+    const upgraded=new SqliteDemoRepository(filename);
+    const row=upgraded.find('old')!;
+    assert.equal(row.publisherMode,'legacy'); assert.equal(row.sourceVersion,6);
+    row.publisherMode='persistent-copy'; row.sourceVersion=14; upgraded.save(row); upgraded.close();
+    const reopened=new SqliteDemoRepository(filename);
+    assert.equal(reopened.find('old')?.publisherMode,'persistent-copy');
+    assert.equal(reopened.find('old')?.sourceVersion,14);
+    reopened.close();
+  } finally {rmSync(directory,{recursive:true,force:true});}
+});

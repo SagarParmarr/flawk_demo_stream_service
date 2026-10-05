@@ -1,3 +1,5 @@
+import { verifyCopyAsset } from './copy-validation.js';
+import type { PreparationProfile } from '../../domain/media-preparation.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { MediaProbe } from '../s3/media-cache.js';
@@ -6,19 +8,22 @@ import { verifySquareProfile } from '../s3/media-cache.js';
 const execute = promisify(execFile);
 
 export function preparationArgs(input: string, output: string, hasAudio: boolean, duration: number,
-  cropX: number, cropY: number, threads = 2): string[] {
+  cropX: number, cropY: number, threads = 2, profile: PreparationProfile = 'square800-v1'): string[] {
   if (![cropX, cropY].every(v => Number.isFinite(v) && v >= 0 && v <= 1)
     || !Number.isFinite(duration) || duration <= 0 || duration > 3600) throw new Error('Invalid media preparation parameters');
+  const copy = profile === 'square800-copy-v2';
+  const outputDuration = copy ? Math.ceil(duration / 2) * 2 : duration;
   return ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-protocol_whitelist', 'file,pipe', '-i', input,
     ...(!hasAudio ? ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'] : []),
     '-map', '0:v:0', '-map', hasAudio ? '0:a:0' : '1:a:0', '-map_metadata', '-1',
-    '-vf', `scale=trunc(iw*sar/2)*2:ih,setsar=1,scale=800:800:force_original_aspect_ratio=increase:out_range=tv,crop=800:800:(iw-ow)*${cropX.toFixed(6)}:(ih-oh)*${cropY.toFixed(6)},setsar=1,fps=30`,
+    '-vf', `scale=trunc(iw*sar/2)*2:ih,setsar=1,scale=800:800:force_original_aspect_ratio=increase:out_range=tv,crop=800:800:(iw-ow)*${cropX.toFixed(6)}:(ih-oh)*${cropY.toFixed(6)},setsar=1,fps=30${copy ? ',tpad=stop_mode=clone:stop_duration=2' : ''}`,
     '-filter_threads', String(threads), '-threads', String(threads), '-r', '30',
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-color_range', 'tv', '-profile:v', 'main', '-preset', 'veryfast',
+    ...(copy ? ['-level:v', '3.2', '-refs', '1', '-bf', '0', '-tune', 'zerolatency'] : []),
     '-b:v', '3000k', '-minrate', '3000k', '-maxrate', '3000k', '-bufsize', '3000k',
-    '-x264-params', 'nal-hrd=cbr:force-cfr=1', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+    '-x264-params', copy ? 'nal-hrd=vbr:force-cfr=1:open-gop=0' : 'nal-hrd=cbr:force-cfr=1', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
     '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-ar', '44100', '-af', 'aresample=async=1:first_pts=0,apad',
-    '-t', String(duration), '-movflags', '+faststart', '-f', 'mp4', output];
+    '-t', String(outputDuration), '-movflags', '+faststart', '-f', 'mp4', output];
 }
 
 export class SquarePreparation {
@@ -36,15 +41,16 @@ export class SquarePreparation {
     return probe;
   }
 
-  async convert(input: string, output: string, probe: MediaProbe, cropX: number, cropY: number, signal?: AbortSignal): Promise<void> {
+  async convert(input: string, output: string, probe: MediaProbe, cropX: number, cropY: number, signal?: AbortSignal, profile: PreparationProfile = 'square800-v1'): Promise<void> {
     const video = probe.streams?.find(s => s.codec_type === 'video');
     await execute(this.ffmpeg, preparationArgs(input, output, probe.streams?.some(s => s.codec_type === 'audio') ?? false,
-      Number(video?.duration ?? probe.format?.duration), cropX, cropY, this.threads),
+      Number(video?.duration ?? probe.format?.duration), cropX, cropY, this.threads, profile),
     { timeout: 900000, maxBuffer: 1024 * 1024, killSignal: 'SIGKILL', signal });
   }
 
-  async verify(input: string, signal?: AbortSignal): Promise<number> {
+  async verify(input: string, signal?: AbortSignal, profile: PreparationProfile = 'square800-v1'): Promise<number> {
     const probe = await this.probe(input, signal);
+    if (profile === 'square800-copy-v2') await verifyCopyAsset(input, process.env.DEMO_PERSISTENT_PUBLISHER_PATH ?? './native/build/flawk-publisher', signal);
     const { stdout } = await execute(this.ffprobe,
       ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-select_streams', 'v:0', '-show_packets', '-show_entries', 'packet=pts_time,flags', '-of', 'json', input],
       { timeout: 60000, maxBuffer: 16 * 1024 * 1024, signal });

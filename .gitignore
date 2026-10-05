@@ -4,3 +4,5 @@ dist/
 .env.media
 *.sqlite*
 cache/
+native/build/
+work/

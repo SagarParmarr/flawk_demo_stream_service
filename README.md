@@ -109,3 +109,7 @@ See [square media rollout](docs/square-media-rollout.md). Verified `square800-v1
 ## Node media worker
 
 Run `npm run media:dev` locally with worker configuration in `.env`, or build and run `npm run media:prod` under supervision. Use `.env.media.example` and `deploy/flawk-media-worker.service` for the standalone worker; it needs no Go-Live/IVS credentials. One background conversion runs at a time, outside the live switch path. See the [media rollout and timing stages](docs/square-media-rollout.md) for leases, retries, bucket permissions, migration flag and deployment order.
+
+## Optional persistent copy publisher
+
+`DEMO_PERSISTENT_PUBLISHER_ENABLED=false` preserves the existing takeover implementation. Setting it to `true` selects one persistent packet publisher for newly created Demos; mode selection is saved for recovery. This requires the native helper and explicitly prepared `square800-copy-v2` assets. See [persistent publisher build, preparation and rollout](docs/persistent-publisher.md). It does not automatically fix or recover a frozen remote player.

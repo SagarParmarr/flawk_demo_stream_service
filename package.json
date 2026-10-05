@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "node --env-file=.env --watch --import tsx src/server.ts",
@@ -12,7 +14,10 @@
     "media:dev": "node --env-file=.env.media --import tsx src/media-worker.ts",
     "media:prod": "node dist/src/media-worker.js",
     "test": "node --env-file-if-exists=.env --env-file-if-exists=.env.media --experimental-sqlite --import tsx --test test/*.test.ts",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "build:publisher": "sh scripts/build-publisher.sh",
+    "build:all": "npm run build:publisher && npm run build",
+    "test:publisher": "node --import tsx --test test/native-publisher.integration.ts test/native-stall.integration.ts"
   },
   "dependencies": {
     "fastify": "^5.4.0"

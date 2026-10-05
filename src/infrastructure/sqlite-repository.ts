@@ -25,6 +25,13 @@ export class SqliteDemoRepository implements DemoRepository {
         ON demo_sessions(owner_id)
         WHERE status IN ('starting', 'default_live', 'selected_live', 'stopping');
     `);
+    // Upgrade stored JSON, including inactive records, without exposing internal fields in the API.
+    this.db.exec(`UPDATE demo_sessions SET payload = json_set(payload,
+      '$.publisherMode', COALESCE(json_extract(payload, '$.publisherMode'), 'legacy'),
+      '$.sourceVersion', COALESCE(json_extract(payload, '$.sourceVersion'),
+        COALESCE(json_extract(payload, '$.takeoverCount'), 0) + 1))
+      WHERE json_extract(payload, '$.publisherMode') IS NULL
+         OR json_extract(payload, '$.sourceVersion') IS NULL;`);
   }
 
   find(id: string): DemoSession | null {
@@ -60,6 +67,10 @@ export class SqliteDemoRepository implements DemoRepository {
   close(): void { this.db.close(); }
 
   private decode(row: Row | undefined): DemoSession | null {
-    return row ? { selectedExpiresAt: null, presenceExpiresAt: null, ...JSON.parse(row.payload) } as DemoSession : null;
+    if (!row) return null;
+    const session = JSON.parse(row.payload) as DemoSession;
+    return { ...session, selectedExpiresAt: session.selectedExpiresAt ?? null,
+      presenceExpiresAt: session.presenceExpiresAt ?? null, publisherMode: session.publisherMode ?? 'legacy',
+      sourceVersion: session.sourceVersion ?? session.takeoverCount + 1 };
   }
 }

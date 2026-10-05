@@ -1,4 +1,6 @@
 export const SQUARE_PROFILE = 'square800-v1';
+export const COPY_PROFILE = 'square800-copy-v2';
+export type PreparationProfile = typeof SQUARE_PROFILE | typeof COPY_PROFILE;
 export interface MediaPreparationJob {
   asset_id: number;
   generation: string;
@@ -10,11 +12,11 @@ export interface MediaPreparationJob {
   output_key: string;
   crop_x: number;
   crop_y: number;
-  media_profile: typeof SQUARE_PROFILE;
+  media_profile: PreparationProfile;
 }
 export interface MediaPreparationResult {
   output_key: string;
-  media_profile: typeof SQUARE_PROFILE;
+  media_profile: PreparationProfile;
   width: 800;
   height: 800;
   duration_seconds: number;

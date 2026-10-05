@@ -16,6 +16,9 @@ export interface DemoSession {
   assetId: number | null;
   decisionId: string | null;
   decisionCursor: number;
+  publisherMode?: 'legacy' | 'persistent-copy';
+  sourceVersion?: number;
+  persistentDefaultS3Uri?: string;
   priority: number;
   takeoverCount: number;
   selectedStartedAt: string | null;
@@ -68,6 +71,7 @@ export interface Publisher {
   readonly startedAt: string;
   readonly durationSeconds: number | null;
   readonly exit: Promise<number | null>;
+  switchSource?(media: PreparedMedia, requestId: string, signal: AbortSignal): Promise<{ committedAt: string; outputTimestamp: number }>;
   stop(): Promise<void>;
   alive(): boolean;
 }

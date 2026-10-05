@@ -26,7 +26,7 @@ test('untrusted jobs cannot choose arbitrary S3 buckets or output paths', () => 
   }
 });
 
-async function fixture(options: { current?: boolean; accepted?: boolean; failConversion?: boolean; callbackFailure?: boolean; lostFirstCallback?: boolean } = {}) {
+async function fixture(options: { current?: boolean; accepted?: boolean; failConversion?: boolean; callbackFailure?: boolean; lostFirstCallback?: boolean; copyProfile?: boolean } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'node-media-test-'));
   const config: MediaWorkerConfig = { laravelBaseUrl: 'https://cms.test', secret: 'secret', outputBucket: 'allowed', sourceBuckets: ['allowed'],
     directory, aws: 'aws', ffmpeg: 'ffmpeg', ffprobe: 'ffprobe', pollIntervalMs: 2000, threads: 2 };
@@ -35,10 +35,10 @@ async function fixture(options: { current?: boolean; accepted?: boolean; failCon
   const log = { debug: (entry: Record<string, unknown>) => entries.push(entry), info: (entry: Record<string, unknown>) => entries.push(entry), warn: (entry: Record<string, unknown>) => entries.push(entry) } as unknown as FastifyBaseLogger;
   let callbacks = 0;
   const queue: MediaPreparationQueue = {
-    claim: async () => structuredClone(job), current: async () => options.current ?? true,
+    claim: async () => options.copyProfile ? {...structuredClone(job),media_profile:'square800-copy-v2',output_key:job.output_key.replace('square800-v1','square800-copy-v2')} : structuredClone(job), current: async () => options.current ?? true,
     complete: async (_job, result) => {
       calls.push('complete'); callbacks++;
-      assert.equal(result.duration_seconds, 3.25); assert.equal(result.media_profile, 'square800-v1');
+      assert.equal(result.duration_seconds, 3.25); assert.equal(result.media_profile, options.copyProfile ? 'square800-copy-v2' : 'square800-v1');
       if (options.callbackFailure || (options.lostFirstCallback && callbacks === 1)) throw new Error('SECRET_CALLBACK_TOKEN');
       return options.accepted ?? true;
     },
@@ -48,7 +48,8 @@ async function fixture(options: { current?: boolean; accepted?: boolean; failCon
     discard: async () => { calls.push('discard'); } };
   const encoder = {
     probe: async () => { calls.push('probe'); return {}; },
-    convert: async (_input: string, _output: string, _probe: unknown, cropX: number, cropY: number) => {
+    convert: async (_input: string, _output: string, _probe: unknown, cropX: number, cropY: number, _signal?: AbortSignal, profile?: string) => {
+      assert.equal(profile,options.copyProfile ? 'square800-copy-v2' : 'square800-v1');
       calls.push('convert'); assert.equal(cropX, job.crop_x); assert.equal(cropY, job.crop_y);
       if (options.failConversion) throw new Error('SECRET_FFMPEG_COMMAND');
     },
@@ -152,4 +153,9 @@ test('S3 preparation checks size, uploads profile metadata and verifies it befor
     await writeFile(sizeFile, String(101 * 1024 * 1024));
     await assert.rejects(storage.download(job, local), /size limit/);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('explicit v2 jobs select the new encoder profile and report the same profile to CMS', async () => {
+  const {calls}=await fixture({copyProfile:true});
+  assert.ok(calls.includes('complete') && !calls.includes('fail'));
 });

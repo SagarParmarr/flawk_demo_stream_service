@@ -1,6 +1,9 @@
 import path from 'node:path';
 
 export interface Config {
+  persistentPublisherEnabled?: boolean;
+  persistentPublisherPath?: string;
+  persistentDefaultS3Uri?: string;
   host: string;
   port: number;
   laravelBaseUrl: string;
@@ -32,6 +35,12 @@ const integer = (name: string, fallback: number, minimum: number, maximum: numbe
   return value;
 };
 
+export function parsePersistentFlag(value: string | undefined): boolean {
+  if (value === undefined || value === 'false') return false;
+  if (value === 'true') return true;
+  throw new Error('DEMO_PERSISTENT_PUBLISHER_ENABLED must be true or false');
+}
+
 export function loadConfig(): Config {
   const laravelSecret = required('DEMO_STREAM_SERVICE_SECRET');
   const nodeSecret = required('GO_LIVE_ADAPTIVE_INTERNAL_SECRET');
@@ -43,7 +52,14 @@ export function loadConfig(): Config {
   }
   const defaultS3Uri = required('ADAPTIVE_DEFAULT_ASSET_S3_URI');
   if (!/^s3:\/\/[^/]+\/.+/.test(defaultS3Uri)) throw new Error('Default asset must be an S3 URI');
+  const persistentDefaultS3Uri = process.env.DEMO_PERSISTENT_DEFAULT_ASSET_S3_URI;
+  if (persistentDefaultS3Uri !== undefined && !/^s3:\/\/[^/]+\/.+\.mp4$/i.test(persistentDefaultS3Uri)) {
+    throw new Error('Persistent default must be an S3 MP4 URI');
+  }
   return {
+    persistentDefaultS3Uri,
+    persistentPublisherEnabled: parsePersistentFlag(process.env.DEMO_PERSISTENT_PUBLISHER_ENABLED),
+    persistentPublisherPath: path.resolve(process.env.DEMO_PERSISTENT_PUBLISHER_PATH ?? './native/build/flawk-publisher'),
     host: process.env.HOST ?? '127.0.0.1',
     port: integer('PORT', 4180, 1, 65535),
     laravelBaseUrl,

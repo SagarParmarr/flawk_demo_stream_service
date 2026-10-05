@@ -1,3 +1,4 @@
+import { verifyCopyAsset } from '../ffmpeg/copy-validation.js';
 import type { FastifyBaseLogger } from 'fastify';
 import type { PreparedMedia } from '../../domain/demo.js';
 import { timed, type TimingContext } from '../../observability/timing.js';
@@ -34,7 +35,7 @@ export function verifySquareProfile(probe: MediaProbe, keyframes: number[]): voi
 }
 
 export class MediaCache {
-  constructor(private readonly directory: string, private readonly aws: string, private readonly ffprobe: string, private readonly log?: FastifyBaseLogger) {}
+  constructor(private readonly directory: string, private readonly aws: string, private readonly ffprobe: string, private readonly log?: FastifyBaseLogger, private readonly persistentBinary = process.env.DEMO_PERSISTENT_PUBLISHER_PATH ?? './native/build/flawk-publisher') {}
 
   async prepare(uri: string, version: string, context: TimingContext = {}, expectedProfile?: string | null): Promise<PreparedMedia> {
     const match = /^s3:\/\/([^/]+)\/(.+\.mp4)$/i.exec(uri);
@@ -44,10 +45,10 @@ export class MediaCache {
       ['s3api', 'head-object', '--bucket', match[1]!, '--key', match[2]!, '--output', 'json'], { timeout: 15000 }));
     const metadata = JSON.parse(head) as { ETag?: string; ContentLength?: number; LastModified?: string; Metadata?: Record<string, string> };
     const mediaProfile = metadata.Metadata?.['media-profile'] ?? null;
-    if (expectedProfile && (expectedProfile !== 'square800-v1' || mediaProfile !== expectedProfile)) {
+    if (expectedProfile && (!['square800-v1', 'square800-copy-v2'].includes(expectedProfile) || mediaProfile !== expectedProfile)) {
       throw new Error('Prepared asset profile marker is missing or unsupported');
     }
-    if (mediaProfile && mediaProfile !== 'square800-v1') throw new Error('Unsupported prepared asset profile');
+    if (mediaProfile && mediaProfile !== 'square800-v1' && !(expectedProfile === 'square800-copy-v2' && mediaProfile === expectedProfile)) throw new Error('Unsupported prepared asset profile');
     const cacheVersion = version === 'default' ? `${metadata.ETag}:${metadata.ContentLength}:${metadata.LastModified}` : version;
     const filename = `${createHash('sha256').update(`${uri}\0${cacheVersion}`).digest('hex')}.mp4`;
     const destination = path.join(this.directory, filename);
@@ -73,7 +74,8 @@ export class MediaCache {
       const packets = JSON.parse(packetJson) as { packets: Array<{ pts_time: string; flags: string }> };
       verifySquareProfile(probe, packets.packets.filter(p => p.flags.includes('K')).map(p => Number(p.pts_time)));
     }
-    const publishMode = mediaProfile === 'square800-v1' ? 'copy' : 'encode';
+    if (mediaProfile === 'square800-copy-v2') await verifyCopyAsset(destination, this.persistentBinary);
+    const publishMode = ['square800-v1', 'square800-copy-v2'].includes(mediaProfile ?? '') ? 'copy' : 'encode';
     this.log?.info?.({ ...context, event: 'demo_media_ready', publishMode, mediaProfile, durationSeconds }, 'Demo asset verified');
     return { path: destination, hasAudio: probe.streams.some(s => s.codec_type === 'audio'), durationSeconds, publishMode, mediaProfile };
   }
